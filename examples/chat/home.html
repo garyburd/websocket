@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat Example</title>
+<style>
+html {
+    overflow: hidden;
+}
+
+body {
+    overflow: hidden;
+    padding: 0;
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: gray;
+}
+
+#log {
+    background: white;
+    margin: 0;
+    padding: 0.5em;
+    position: absolute;
+    top: 0.5em;
+    left: 0.5em;
+    right: 0.5em;
+    bottom: 3em;
+    overflow: auto;
+}
+
+#form {
+    padding: 0 0.5em;
+    margin: 0;
+    position: absolute;
+    bottom: 1em;
+    left: 0;
+    width: 100%;
+    overflow: hidden;
+}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<form id="form">
+    <input type="submit" value="Send">
+    <input type="text" id="msg" size="64" autofocus>
+</form>
+<script>
+const msg = document.getElementById("msg");
+const log = document.getElementById("log");
+
+// appendLog adds item to the chat log. So the user can scroll back through
+// history without being yanked away by new messages, it auto-scrolls only when
+// the log is already at the bottom.
+function appendLog(item) {
+    const doScroll = log.scrollTop > log.scrollHeight - log.clientHeight - 1;
+    log.appendChild(item);
+    if (doScroll) {
+        log.scrollTop = log.scrollHeight - log.clientHeight;
+    }
+}
+
+const proto = location.protocol === "https:" ? "wss:" : "ws:";
+const conn = new WebSocket(`${proto}//${location.host}/ws`);
+
+conn.addEventListener("close", () => {
+    const item = document.createElement("div");
+    item.innerHTML = "<b>Connection closed.</b>";
+    appendLog(item);
+});
+
+conn.addEventListener("message", (evt) => {
+    // The server may coalesce several chat lines into one message, separated by
+    // newlines; split them back out so each appears on its own.
+    for (const message of evt.data.split("\n")) {
+        const item = document.createElement("div");
+        item.innerText = message;
+        appendLog(item);
+    }
+});
+
+document.getElementById("form").addEventListener("submit", (evt) => {
+    evt.preventDefault();
+    if (conn.readyState !== WebSocket.OPEN || !msg.value) {
+        return;
+    }
+    conn.send(msg.value);
+    msg.value = "";
+});
+</script>
+</body>
+</html>

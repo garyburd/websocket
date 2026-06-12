@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command Example</title>
+<style>
+html {
+    overflow: hidden;
+}
+
+body {
+    overflow: hidden;
+    padding: 0;
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: gray;
+}
+
+#log {
+    background: black;
+    color: #ddd;
+    font-family: monospace;
+    white-space: pre-wrap;
+    margin: 0;
+    padding: 0.5em;
+    position: absolute;
+    top: 0.5em;
+    left: 0.5em;
+    right: 0.5em;
+    bottom: 3em;
+    overflow: auto;
+}
+
+/* Lines the user typed, to set them apart from command output. */
+#log .sent {
+    color: #5ec8ff;
+}
+
+/* The command's standard error. */
+#log .stderr {
+    color: #ff7b72;
+}
+
+#log .notice {
+    color: #888;
+    font-style: italic;
+}
+
+#form {
+    padding: 0 0.5em;
+    margin: 0;
+    position: absolute;
+    bottom: 1em;
+    left: 0;
+    width: 100%;
+    overflow: hidden;
+}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<form id="form">
+    <input type="submit" value="Send">
+    <input type="text" id="msg" size="64" autofocus>
+    <button type="button" id="eof">Close input</button>
+</form>
+<script>
+const msg = document.getElementById("msg");
+const log = document.getElementById("log");
+
+function appendLog(text, cls) {
+    const doScroll = log.scrollTop > log.scrollHeight - log.clientHeight - 1;
+    const item = document.createElement("div");
+    if (cls) {
+        item.className = cls;
+    }
+    item.innerText = text;
+    log.appendChild(item);
+    if (doScroll) {
+        log.scrollTop = log.scrollHeight - log.clientHeight;
+    }
+}
+
+const proto = location.protocol === "https:" ? "wss:" : "ws:";
+const conn = new WebSocket(`${proto}//${location.host}/ws`);
+
+conn.addEventListener("close", () => {
+    appendLog("[connection closed]", "notice");
+});
+
+conn.addEventListener("message", (evt) => {
+    // Each server message is a stream tag ("1" stdout, "2" stderr) followed by
+    // the line. Style stderr differently; stdout uses the default.
+    const tag = evt.data[0];
+    const text = evt.data.slice(1);
+    appendLog(text, tag === "2" ? "stderr" : null);
+});
+
+document.getElementById("form").addEventListener("submit", (evt) => {
+    evt.preventDefault();
+    if (conn.readyState !== WebSocket.OPEN || !msg.value) {
+        return;
+    }
+    // Each message starts with a tag byte; "0" marks a line for stdin. Echo the
+    // input into the log so the conversation reads as a transcript, styled to
+    // set it apart from the command's output.
+    conn.send("0" + msg.value);
+    appendLog("> " + msg.value, "sent");
+    msg.value = "";
+});
+
+document.getElementById("eof").addEventListener("click", (evt) => {
+    if (conn.readyState !== WebSocket.OPEN) {
+        return;
+    }
+    // "X" is the end-of-input control: the server closes the command's stdin so
+    // it sees EOF. The connection stays open, so any final output the command
+    // writes on EOF still streams back. No more input is accepted afterward, so
+    // disable the input controls.
+    conn.send("X");
+    appendLog("[input closed]", "notice");
+    msg.disabled = true;
+    evt.target.disabled = true;
+});
+</script>
+</body>
+</html>

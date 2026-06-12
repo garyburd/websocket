@@ -1,0 +1,12 @@
+{
+    "outdir": "/reports/servers",
+    "servers": [
+        {
+            "agent": "garyburd-websocket",
+            "url": "ws://host.docker.internal:9001"
+        }
+    ],
+    "cases": ["*"],
+    "exclude-cases": [],
+    "exclude-agent-cases": {}
+}
