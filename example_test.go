@@ -3,7 +3,7 @@ package websocket_test
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -51,7 +51,7 @@ func ExampleWriter_Final() {
 
 	err := c.Write(context.Background(), websocket.MessageText, nil, func(w *websocket.Writer) error {
 		bw := bufio.NewWriter(w)
-		// ... write the message to bw, e.g. with a json.Encoder ...
+		// ... write the message to bw, e.g. with json.MarshalWrite ...
 		bw.WriteString("hello, world")
 
 		w.Final()         // the next flush ends the message
@@ -194,10 +194,11 @@ func ExampleConn_Shutdown() {
 	}
 }
 
-// The package has no JSON helpers; use encoding/json directly over the streaming
-// [websocket.Writer] and [websocket.Reader]. Sending encodes into the writer;
-// receiving decodes from the reader within the read callback. The server here
-// decodes each message and replies with a JSON message of its own.
+// The package has no JSON helpers; use encoding/json/v2 directly over the
+// streaming [websocket.Writer] and [websocket.Reader]. Sending marshals into
+// the writer; receiving unmarshals from the reader within the read callback.
+// The server here decodes each message and replies with a JSON message of its
+// own.
 func Example_json() {
 	type message struct {
 		Greeting string `json:"greeting"`
@@ -214,14 +215,14 @@ func Example_json() {
 		for {
 			var in message
 			err := c.Read(nil, func(rd *websocket.Reader) error {
-				return json.NewDecoder(rd).Decode(&in)
+				return json.UnmarshalRead(rd, &in)
 			})
 			if err != nil {
 				return
 			}
 			reply := message{Greeting: "hi " + in.Greeting, N: in.N + 1}
 			err = c.Write(context.Background(), websocket.MessageText, nil, func(wr *websocket.Writer) error {
-				return json.NewEncoder(wr).Encode(reply)
+				return json.MarshalWrite(wr, reply)
 			})
 			if err != nil {
 				return
@@ -240,7 +241,7 @@ func Example_json() {
 
 	// Send: encode a value as one text message.
 	err = c.Write(context.Background(), websocket.MessageText, nil, func(w *websocket.Writer) error {
-		return json.NewEncoder(w).Encode(message{Greeting: "there", N: 1})
+		return json.MarshalWrite(w, message{Greeting: "there", N: 1})
 	})
 	if err != nil {
 		fmt.Println("write:", err)
@@ -250,7 +251,7 @@ func Example_json() {
 	// Receive: decode the reply into a value.
 	var in message
 	err = c.Read(nil, func(r *websocket.Reader) error {
-		return json.NewDecoder(r).Decode(&in)
+		return json.UnmarshalRead(r, &in)
 	})
 	if err != nil {
 		fmt.Println("read:", err)

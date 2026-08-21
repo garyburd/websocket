@@ -11,6 +11,14 @@ import (
 	"testing"
 )
 
+// newTestServer starts Go 1.27's in-memory test network and returns the
+// transport Dial must use to reach it.
+func newTestServer(t testing.TB, handler http.Handler) (*httptest.Server, *http.Transport) {
+	t.Helper()
+	srv := httptest.NewTestServer(t, handler)
+	return srv, srv.Client().Transport.(*http.Transport)
+}
+
 func TestDialRejectsSecWebSocketHeader(t *testing.T) {
 	// Sec-WebSocket-* headers carry handshake semantics Dial owns;
 	// supplying one is a caller error caught before any network I/O,
@@ -62,7 +70,7 @@ func TestDialSubprotocolCaseSensitive(t *testing.T) {
 		{"CaseDifferenceRejected", "CHAT", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				c, err := Upgrade(w, r, &UpgradeOptions{
 					SelectSubprotocol: func(*http.Request) string { return tc.selected },
 				})
@@ -70,10 +78,12 @@ func TestDialSubprotocolCaseSensitive(t *testing.T) {
 					c.Close()
 				}
 			}))
-			defer srv.Close()
 			wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-			c, _, err := Dial(context.Background(), wsURL, &DialOptions{Subprotocols: []string{"chat"}}, nil)
+			c, _, err := Dial(context.Background(), wsURL, &DialOptions{
+				Transport:    transport,
+				Subprotocols: []string{"chat"},
+			}, nil)
 			if tc.wantOK {
 				if err != nil {
 					t.Fatalf("Dial err = %v, want success", err)
@@ -94,7 +104,7 @@ func TestDialSubprotocolCaseSensitive(t *testing.T) {
 func TestDialSchemeCaseInsensitive(t *testing.T) {
 	// URL schemes are case-insensitive (RFC 3986 §3.1): WS:// and WSS://
 	// must be translated for net/http just like their lowercase forms.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("Upgrade: %v", err)
@@ -102,10 +112,9 @@ func TestDialSchemeCaseInsensitive(t *testing.T) {
 		}
 		c.Close()
 	}))
-	defer srv.Close()
 	wsURL := "WS" + strings.TrimPrefix(srv.URL, "http")
 
-	c, _, err := Dial(context.Background(), wsURL, nil, nil)
+	c, _, err := Dial(context.Background(), wsURL, &DialOptions{Transport: transport}, nil)
 	if err != nil {
 		t.Fatalf("Dial(%q) = %v, want success", wsURL, err)
 	}
@@ -118,11 +127,10 @@ func TestDialCapturesFailureBody(t *testing.T) {
 	// snapshots up to N bytes into a bytes.Reader so the caller can read
 	// the error body off the returned response without owning the conn.
 	const body = "denied: token expired"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		io.WriteString(w, body)
 	}))
-	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
 	for _, tc := range []struct {
@@ -135,7 +143,10 @@ func TestDialCapturesFailureBody(t *testing.T) {
 		{"zero discards body", 0, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, resp, err := Dial(context.Background(), wsURL, &DialOptions{ResponseBodyLimit: tc.limit}, nil)
+			c, resp, err := Dial(context.Background(), wsURL, &DialOptions{
+				Transport:         transport,
+				ResponseBodyLimit: tc.limit,
+			}, nil)
 			if c != nil {
 				c.Close()
 				t.Fatal("Dial returned a non-nil Conn on handshake failure")
@@ -166,14 +177,13 @@ func TestDialRefusesRedirect(t *testing.T) {
 	// upgrade and may cross origins). The redirect surfaces as an
 	// ErrBadHandshake with the 3xx status, not a followed request.
 	var hits int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		http.Redirect(w, r, "/elsewhere", http.StatusFound)
 	}))
-	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	c, resp, err := Dial(context.Background(), wsURL, nil, nil)
+	c, resp, err := Dial(context.Background(), wsURL, &DialOptions{Transport: transport}, nil)
 	if c != nil {
 		c.Close()
 		t.Fatal("Dial returned a non-nil Conn for a redirect")
@@ -194,10 +204,9 @@ func TestDialHTTP2Hint(t *testing.T) {
 	// telltale of a tls.Config shared with net/http) gets a diagnostic hint
 	// appended to a failed handshake. A transport advertising only HTTP/1.1
 	// does not. The hint never displaces ErrBadHandshake.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 	}))
-	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
 	for _, tc := range []struct {
@@ -209,9 +218,9 @@ func TestDialHTTP2Hint(t *testing.T) {
 		{"http/1.1 only", []string{"http/1.1"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := &DialOptions{Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{NextProtos: tc.nextProto},
-			}}
+			tr := transport.Clone()
+			tr.TLSClientConfig = &tls.Config{NextProtos: tc.nextProto}
+			opts := &DialOptions{Transport: tr}
 			c, _, err := Dial(context.Background(), wsURL, opts, nil)
 			if c != nil {
 				c.Close()

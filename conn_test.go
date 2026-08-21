@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +18,22 @@ import (
 	"testing/synctest"
 	"time"
 )
+
+// TestMain fails the package if Go 1.27's runtime profile finds an unreachable
+// goroutine blocked on a synchronization primitive after the tests finish.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if code == 0 {
+		profile := pprof.Lookup("goroutineleak")
+		var leaks bytes.Buffer
+		_ = profile.WriteTo(&leaks, 1) // bytes.Buffer never returns a write error.
+		if profile.Count() != 0 {
+			fmt.Fprintf(os.Stderr, "runtime goroutineleak profile:\n%s", leaks.Bytes())
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
 
 // newTestConn builds a *Conn over rwc with conservative defaults (specific
 // tests pass overrides via the variadic option) and closes it at cleanup, for
@@ -2022,50 +2041,51 @@ func (c *Conn) errRead() error {
 }
 
 func TestContendedFrameLockTimesOutWithoutTeardown(t *testing.T) {
-	// A write that cannot acquire frameMu within its budget must return
-	// errWriteTimeout and leave the connection untouched: nothing went on the
-	// wire, so the conn stays usable. This is distinct from a mid-write stall
-	// (TestWriteTimeoutFiresWhenPeerStalls), where rwc.Write itself overruns
-	// its deadline and the frame watchdog tears the transport down.
-	// A 50ms control write timeout keeps the contended lock wait short.
-	c, peer := connPair(t, withWriteTimeout(50*time.Millisecond))
+	synctest.Test(t, func(t *testing.T) {
+		// A write that cannot acquire frameMu within its budget must return
+		// errWriteTimeout and leave the connection untouched: nothing went on the
+		// wire, so the conn stays usable. This is distinct from a mid-write stall
+		// (TestWriteTimeoutFiresWhenPeerStalls), where rwc.Write itself overruns
+		// its deadline and the frame watchdog tears the transport down.
+		c, peer := connPair(t, withWriteTimeout(50*time.Millisecond))
 
-	// Occupy frameMu as if another writer held it (frameMu is a 1-slot channel
-	// used as a mutex). A real holder would be parked in rwc.Write; taking the
-	// slot directly is equivalent for the contention path and avoids arming
-	// that holder's own frame timer, which would muddy the assertion.
-	c.frame.mu <- struct{}{}
+		// Occupy frameMu as if another writer held it (frameMu is a 1-slot channel
+		// used as a mutex). A real holder would be parked in rwc.Write; taking the
+		// slot directly is equivalent for the contention path and avoids arming
+		// that holder's own frame timer, which would muddy the assertion.
+		c.frame.mu <- struct{}{}
 
-	// writeControlFrame is bounded by the control write timeout; 50ms can't
-	// win the lock.
-	err := c.writeControlFrame(opPing, []byte("blocked"), c.frame.controlDeadline())
-	if !errors.Is(err, ErrTimeout) {
-		t.Fatalf("contended writeControlFrame = %v, want ErrTimeout", err)
-	}
-	// The FSM is untouched: write half still open, read half not terminal.
-	if c.frame.closeSent {
-		t.Error("close marked sent after a contended lock timeout")
-	}
-	// The test still holds frame.mu (occupied above), so read the frame-guarded
-	// terminal error directly rather than re-acquiring.
-	if werr := c.frame.terminalErr; werr != nil {
-		t.Errorf("write half dead (%v) after a contended lock timeout", werr)
-	}
-	if rerr := c.errRead(); rerr != nil {
-		t.Errorf("read half terminal (%v) after a contended lock timeout", rerr)
-	}
+		// writeControlFrame is bounded by the control write timeout; the bubble's
+		// fake clock advances the 50 ms while the lock remains occupied.
+		err := c.writeControlFrame(opPing, []byte("blocked"), c.frame.controlDeadline())
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("contended writeControlFrame = %v, want ErrTimeout", err)
+		}
+		// The FSM is untouched: write half still open, read half not terminal.
+		if c.frame.closeSent {
+			t.Error("close marked sent after a contended lock timeout")
+		}
+		// The test still holds frame.mu (occupied above), so read the frame-guarded
+		// terminal error directly rather than re-acquiring.
+		if werr := c.frame.terminalErr; werr != nil {
+			t.Errorf("write half dead (%v) after a contended lock timeout", werr)
+		}
+		if rerr := c.errRead(); rerr != nil {
+			t.Errorf("read half terminal (%v) after a contended lock timeout", rerr)
+		}
 
-	// Release the lock; the connection must still be fully usable.
-	<-c.frame.mu
+		// Release the lock; the connection must still be fully usable.
+		<-c.frame.mu
 
-	got := make(chan peerFrame, 1)
-	go func() { got <- readPeerFrame(t, peer) }()
-	if err := c.WriteMessage(context.Background(), MessageText, nil, []byte("still alive")); err != nil {
-		t.Fatalf("WriteMessage after recovered contention = %v, want nil", err)
-	}
-	if f := <-got; f.opcode != opText || !f.fin || string(f.payload) != "still alive" {
-		t.Errorf("recovered frame = %+v, want Text FIN \"still alive\"", f)
-	}
+		got := make(chan peerFrame, 1)
+		go func() { got <- readPeerFrame(t, peer) }()
+		if err := c.WriteMessage(context.Background(), MessageText, nil, []byte("still alive")); err != nil {
+			t.Fatalf("WriteMessage after recovered contention = %v, want nil", err)
+		}
+		if f := <-got; f.opcode != opText || !f.fin || string(f.payload) != "still alive" {
+			t.Errorf("recovered frame = %+v, want Text FIN \"still alive\"", f)
+		}
+	})
 }
 
 func TestFailedPongReplyDisarmsReadWatchdog(t *testing.T) {
@@ -2098,82 +2118,80 @@ func TestFailedPongReplyDisarmsReadWatchdog(t *testing.T) {
 }
 
 func TestTimersStoppedAfterClose(t *testing.T) {
-	// Close must leave no AfterFunc timer pending: the read watchdog, the frame
-	// timer, and the shutdown timer. A timer left armed would fire its callback on
-	// an already-dead connection and, worse, keep the Conn reachable from the
-	// runtime timer heap until it fires (up to an hour for the watchdog),
-	// defeating GC. terminateConn stops the shutdown timer directly but does not
-	// touch the watchdog, which relies on the read exit (endRead) to disarm,
-	// so arm it via a parked read first, to prove that path runs.
-	c, _ := connPair(t)
+	synctest.Test(t, func(t *testing.T) {
+		// Close must leave no AfterFunc timer pending: the read watchdog, the frame
+		// timer, and the shutdown timer. A timer left armed would fire its callback on
+		// an already-dead connection and, worse, keep the Conn reachable from the
+		// runtime timer heap until it fires (up to an hour for the watchdog),
+		// defeating GC. terminateConn stops the shutdown timer directly but does not
+		// touch the watchdog, which relies on the read exit (endRead) to disarm,
+		// so arm it via a parked read first, to prove that path runs.
+		c, _ := connPair(t)
 
-	readDone := make(chan error, 1)
-	go func() {
-		readDone <- c.Read(&ReadOptions{IdleTimeout: time.Hour}, func(*Reader) error { return nil })
-	}()
+		readDone := make(chan error, 1)
+		go func() {
+			readDone <- c.Read(&ReadOptions{IdleTimeout: time.Hour}, func(*Reader) error { return nil })
+		}()
 
-	// Wait until the parked read has armed the watchdog.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+		// The read arms the watchdog before parking on the in-memory transport.
+		synctest.Wait()
 		m := c.lockedMonitor()
 		armed := !m.fireAt.IsZero()
 		m.unlock()
-		if armed {
-			break
-		}
-		if time.Now().After(deadline) {
+		if !armed {
 			t.Fatal("read watchdog never armed")
 		}
-		time.Sleep(time.Millisecond)
-	}
 
-	if err := c.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	<-readDone // the read exits and disarms the watchdog before returning
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		<-readDone // the read exits and disarms the watchdog before returning
 
-	m := c.lockedMonitor()
-	fireAt := m.fireAt
-	m.unlock()
-	if !fireAt.IsZero() {
-		t.Errorf("read watchdog still armed after Close (fireAt = %v)", fireAt)
-	}
-	// Timer.Stop reports false when the timer is already stopped or fired, i.e.
-	// not pending; it doubles as cleanup, since nothing should fire after it.
-	if c.monitor.timer.Stop() {
-		t.Error("read watchdog timer still pending after Close")
-	}
-	if c.frame.timer.Stop() {
-		t.Error("frame timer still pending after Close")
-	}
-	if c.shutdownTimer.Stop() {
-		t.Error("shutdown timer still pending after Close")
-	}
+		m = c.lockedMonitor()
+		fireAt := m.fireAt
+		m.unlock()
+		if !fireAt.IsZero() {
+			t.Errorf("read watchdog still armed after Close (fireAt = %v)", fireAt)
+		}
+		// Timer.Stop reports false when the timer is already stopped or fired, i.e.
+		// not pending; it doubles as cleanup, since nothing should fire after it.
+		if c.monitor.timer.Stop() {
+			t.Error("read watchdog timer still pending after Close")
+		}
+		if c.frame.timer.Stop() {
+			t.Error("frame timer still pending after Close")
+		}
+		if c.shutdownTimer.Stop() {
+			t.Error("shutdown timer still pending after Close")
+		}
+	})
 }
 
 func TestPongReplyTimeoutDoesNotFailRead(t *testing.T) {
-	// A pong reply that cannot win the frame lock within the control-write
-	// budget is benign: nothing reached the wire and the peer is not
-	// necessarily waiting for it. The read must carry on and deliver the
-	// next message rather than fail.
-	c, peer := connPair(t, withWriteTimeout(50*time.Millisecond))
+	synctest.Test(t, func(t *testing.T) {
+		// A pong reply that cannot win the frame lock within the control-write
+		// budget is benign: nothing reached the wire and the peer is not
+		// necessarily waiting for it. The read must carry on and deliver the
+		// next message rather than fail.
+		c, peer := connPair(t, withWriteTimeout(50*time.Millisecond))
 
-	// Occupy frame.mu so the pong reply times out with nothing on the wire.
-	c.frame.mu <- struct{}{}
-	defer func() { <-c.frame.mu }()
+		// Occupy frame.mu so the pong reply times out with nothing on the wire.
+		c.frame.mu <- struct{}{}
+		defer func() { <-c.frame.mu }()
 
-	go func() {
-		_ = writePeerFrame(peer, true, opPing, []byte("p"))
-		_ = writePeerFrame(peer, true, opText, []byte("data"))
-	}()
+		go func() {
+			_ = writePeerFrame(peer, true, opPing, []byte("p"))
+			_ = writePeerFrame(peer, true, opText, []byte("data"))
+		}()
 
-	data, mt, err := c.ReadMessage(nil)
-	if err != nil {
-		t.Fatalf("ReadMessage err = %v, want nil (pong timeout is benign)", err)
-	}
-	if mt != MessageText || string(data) != "data" {
-		t.Errorf("got %v %q, want TEXT \"data\"", mt, data)
-	}
+		data, mt, err := c.ReadMessage(nil)
+		if err != nil {
+			t.Fatalf("ReadMessage err = %v, want nil (pong timeout is benign)", err)
+		}
+		if mt != MessageText || string(data) != "data" {
+			t.Errorf("got %v %q, want TEXT \"data\"", mt, data)
+		}
+	})
 }
 
 func TestCloseEchoFailureStillReportsCloseError(t *testing.T) {
@@ -2198,54 +2216,52 @@ func TestCloseEchoFailureStillReportsCloseError(t *testing.T) {
 }
 
 func TestWriteCallbackErrorParkedReadTerminates(t *testing.T) {
-	// Conn.Write's contract on a callback error: either the transport is closed
-	// and the reader is unblocked, or a graceful shutdown is in progress and the
-	// reader terminates. Here the transport is healthy, so Write starts a close
-	// handshake; a parked read terminates with the CloseError once the peer
-	// echoes the close.
-	c, peer := connPair(t, withBufSize(minWriteBufferSize))
+	synctest.Test(t, func(t *testing.T) {
+		// Conn.Write's contract on a callback error: either the transport is closed
+		// and the reader is unblocked, or a graceful shutdown is in progress and the
+		// reader terminates. Here the transport is healthy, so Write starts a close
+		// handshake; a parked read terminates with the CloseError once the peer
+		// echoes the close.
+		c, peer := connPair(t, withBufSize(minWriteBufferSize))
 
-	// Peer drains frames and echoes the close so the handshake completes.
-	go func() {
-		for {
-			f := readPeerFrame(t, peer)
-			if f.opcode == opClose {
-				_ = writePeerFrame(peer, true, opClose, f.payload)
-				return
+		// Peer drains frames and echoes the close so the handshake completes.
+		go func() {
+			for {
+				f := readPeerFrame(t, peer)
+				if f.opcode == opClose {
+					_ = writePeerFrame(peer, true, opClose, f.payload)
+					return
+				}
 			}
-		}
-	}()
+		}()
 
-	readErr := make(chan error, 1)
-	go func() {
-		_, _, err := c.ReadMessage(nil)
-		readErr <- err
-	}()
-	// Let the reader park in the transport read.
-	time.Sleep(10 * time.Millisecond)
+		readErr := make(chan error, 1)
+		go func() {
+			_, _, err := c.ReadMessage(nil)
+			readErr <- err
+		}()
+		// Let both the peer and reader park on their transport reads.
+		synctest.Wait()
 
-	boom := errors.New("boom")
-	err := c.Write(context.Background(), MessageBinary, nil, func(w *Writer) error {
-		// 100 B overflows the 64 B staging buffer: a frame goes out.
-		if _, err := w.Write(make([]byte, 100)); err != nil {
-			return err
+		boom := errors.New("boom")
+		err := c.Write(context.Background(), MessageBinary, nil, func(w *Writer) error {
+			// 100 B overflows the 64 B staging buffer: a frame goes out.
+			if _, err := w.Write(make([]byte, 100)); err != nil {
+				return err
+			}
+			return boom
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("Write err = %v, want %v", err, boom)
 		}
-		return boom
-	})
-	if !errors.Is(err, boom) {
-		t.Fatalf("Write err = %v, want %v", err, boom)
-	}
-	select {
-	case err := <-readErr:
+		err = <-readErr
 		var ce *CloseError
 		if !errors.As(err, &ce) {
 			t.Errorf("parked read err = %v, want *CloseError from the handshake", err)
 		} else if ce.Code != CloseInternalError {
 			t.Errorf("parked read close code = %d, want %d (CloseInternalError)", ce.Code, CloseInternalError)
 		}
-	case <-time.After(5 * time.Second):
-		t.Error("parked read did not terminate after graceful shutdown")
-	}
+	})
 }
 
 func TestShutdownAfterEchoConsumedClosesCleanly(t *testing.T) {

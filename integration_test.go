@@ -4,17 +4,16 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
 func TestUpgradeAndExchange(t *testing.T) {
-	// End-to-end round trip: real HTTP server, Dial handshakes, then
+	// End-to-end round trip: in-memory HTTP server, Dial handshakes, then
 	// each side reads what the other writes through the framing layer
 	// (server unmasked outbound, client masked outbound).
 	serverDone := make(chan error, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := Upgrade(w, r, &UpgradeOptions{
 			SelectSubprotocol: SupportedSubprotocols("chat.v1", "chat.v2"),
 		})
@@ -38,10 +37,12 @@ func TestUpgradeAndExchange(t *testing.T) {
 		}
 		serverDone <- nil
 	}))
-	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	c, _, err := Dial(context.Background(), wsURL, &DialOptions{Subprotocols: []string{"chat.v2"}}, nil)
+	c, _, err := Dial(context.Background(), wsURL, &DialOptions{
+		Transport:    transport,
+		Subprotocols: []string{"chat.v2"},
+	}, nil)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}

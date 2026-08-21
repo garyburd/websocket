@@ -252,7 +252,7 @@ func TestMessageTimeoutStopsAtBodyEnd(t *testing.T) {
 					}
 					// MessageTimeout bounds body I/O, not application work after
 					// the complete body has been consumed.
-					time.Sleep(100 * time.Millisecond)
+					synctest.Sleep(100 * time.Millisecond)
 					return nil
 				})
 				if err != nil {
@@ -279,7 +279,7 @@ func TestMessageTimeoutStopsAtBodyEnd(t *testing.T) {
 				}
 				// The payload is already buffered from the transport but remains
 				// unread by the application.
-				time.Sleep(100 * time.Millisecond)
+				synctest.Sleep(100 * time.Millisecond)
 				return nil
 			})
 			if err != nil {

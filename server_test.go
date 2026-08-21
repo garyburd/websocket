@@ -151,19 +151,18 @@ func TestAllowedOriginsInvalidPatternPanics(t *testing.T) {
 
 func TestUpgradeDefaultHostCheckRejectsOtherHost(t *testing.T) {
 	// With CheckOrigin == nil, Upgrade enforces the default host check.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, err := Upgrade(w, r, nil)
 		if !errors.Is(err, ErrBadHandshake) {
 			t.Errorf("Upgrade err = %v, want ErrBadHandshake", err)
 		}
 	}))
-	defer srv.Close()
 
 	// Dial with a foreign Origin set via the header argument.
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	header := http.Header{}
 	header.Set("Origin", "https://evil.example.com")
-	_, resp, err := Dial(context.Background(), wsURL, nil, header)
+	_, resp, err := Dial(context.Background(), wsURL, &DialOptions{Transport: transport}, header)
 	if !errors.Is(err, ErrBadHandshake) {
 		t.Fatalf("Dial err = %v, want ErrBadHandshake", err)
 	}
@@ -180,7 +179,7 @@ func TestUpgradeOnErrorRendersCustomResponse(t *testing.T) {
 	// payload (à la RFC 9457) instead of http.Error's plain text, while
 	// keeping the status Upgrade chose and the ErrBadHandshake error.
 	const body = `{"error":"forbidden origin"}`
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, err := Upgrade(w, r, &UpgradeOptions{
 			OnError: func(w http.ResponseWriter, r *http.Request, status int, err error) {
 				if !errors.Is(err, ErrBadHandshake) {
@@ -195,14 +194,16 @@ func TestUpgradeOnErrorRendersCustomResponse(t *testing.T) {
 			t.Errorf("Upgrade err = %v, want ErrBadHandshake", err)
 		}
 	}))
-	defer srv.Close()
 
 	// Reject a request whose Origin host differs from the request Host
 	// (default host check).
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	header := http.Header{}
 	header.Set("Origin", "https://evil.example.com")
-	_, resp, err := Dial(context.Background(), wsURL, &DialOptions{ResponseBodyLimit: 1024}, header)
+	_, resp, err := Dial(context.Background(), wsURL, &DialOptions{
+		Transport:         transport,
+		ResponseBodyLimit: 1024,
+	}, header)
 	if !errors.Is(err, ErrBadHandshake) {
 		t.Fatalf("Dial err = %v, want ErrBadHandshake", err)
 	}
