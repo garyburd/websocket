@@ -18,6 +18,9 @@ the suite marks `FAILED`.
   server.
 - `TestAutobahnClient` drives our `Dial` client through `wstest -m fuzzingserver`.
 - `config/` holds the two suite config files.
+- `wstest` writes its reports inside the container; the tests copy them out
+  with `docker cp`. Docker Desktop's macOS bind mounts can fail its writes
+  with `EDEADLK`, after which `wstest` hangs.
 
 The tests are compiled by ordinary `go test ./...` (so an API change here is a
 build error) but **skip** unless explicitly enabled, since they need Docker and
@@ -36,11 +39,6 @@ Browsable per-case results land in `reports/servers/index.html` and
 
 ## Notes on expected results
 
-- **UTF-8.** The library deliberately does not validate UTF-8 on inbound text
-  payloads — it delivers bytes verbatim and documents that applications should
-  validate at their layer. The echo program does exactly that, failing the
-  connection with close code 1007, which the suite's `6.*` cases require. So the
-  run reflects "library + the documented application-side check."
 - **permessage-deflate.** Not implemented, so the compression cases (`12.*`,
   `13.*`) report `UNIMPLEMENTED`, which is not treated as a failure.
 - A genuinely `FAILED` case is a real conformance gap; open the HTML report for

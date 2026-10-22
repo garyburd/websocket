@@ -17,15 +17,18 @@
 package autobahn
 
 import (
+	"bytes"
 	"context"
 	"encoding/json/v2"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -73,7 +76,7 @@ func requireSuite(t *testing.T) {
 // TestAutobahnServer runs `wstest -m fuzzingclient` against our echo server.
 func TestAutobahnServer(t *testing.T) {
 	requireSuite(t)
-	reports := reportsDir(t)
+	clearReports(t, "servers")
 
 	srv := &http.Server{Handler: echoHandler()}
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -88,26 +91,32 @@ func TestAutobahnServer(t *testing.T) {
 		// host.docker.internal is built in on Docker Desktop; Linux needs it.
 		args = append(args, "--add-host=host.docker.internal:host-gateway")
 	}
+	const name = "autobahn-fuzzingclient"
 	args = append(args,
-		"-v", confDir(t)+":/config",
-		"-v", reports+":/reports",
+		"-v", confDir(t)+":/config:ro",
 		image, "wstest", "-m", "fuzzingclient", "-s", "/config/fuzzingclient.json")
-	dockerRun(t, args...)
+	out := dockerRun(t, name, args...)
 
-	checkReport(t, filepath.Join(reports, "servers", "index.json"))
+	// wstest exits 0 even when it abandons the run partway, so compare the
+	// report against the number of cases it planned.
+	m := regexp.MustCompile(`will run (\d+) test cases`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatal("wstest output does not state the planned case count")
+	}
+	want, _ := strconv.Atoi(m[1])
+	checkReport(t, filepath.Join(copyReports(t, name, "servers"), "index.json"), want)
 }
 
 // TestAutobahnClient drives our Dial client through `wstest -m fuzzingserver`.
 func TestAutobahnClient(t *testing.T) {
 	requireSuite(t)
-	reports := reportsDir(t)
+	clearReports(t, "clients")
 
 	const name = "autobahn-fuzzingserver"
 	exec.Command("docker", "rm", "-f", name).Run() // remove any stale container
 	cmd := exec.Command("docker", "run", "--rm", "--name", name,
 		"-p", fmt.Sprintf("%d:%d", port, port),
-		"-v", confDir(t)+":/config",
-		"-v", reports+":/reports",
+		"-v", confDir(t)+":/config:ro",
 		image, "wstest", "-m", "fuzzingserver", "-s", "/config/fuzzingserver.json")
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -118,10 +127,10 @@ func TestAutobahnClient(t *testing.T) {
 		cmd.Wait()
 	})
 
-	driveClient(t, fmt.Sprintf("ws://127.0.0.1:%d", port))
+	n := driveClient(t, fmt.Sprintf("ws://127.0.0.1:%d", port))
 	time.Sleep(time.Second) // let the server flush its report
 
-	checkReport(t, filepath.Join(reports, "clients", "index.json"))
+	checkReport(t, filepath.Join(copyReports(t, name, "clients"), "index.json"), n)
 }
 
 // echoHandler upgrades and echoes; it's what the fuzzingclient connects to.
@@ -161,8 +170,8 @@ func drain(c *websocket.Conn) {
 }
 
 // driveClient runs every case the fuzzingserver offers, then asks it to write
-// its report.
-func driveClient(t *testing.T, server string) {
+// its report. It returns the number of cases.
+func driveClient(t *testing.T, server string) int {
 	n := caseCount(t, server)
 	t.Logf("running %d cases", n)
 	for i := 1; i <= n; i++ {
@@ -171,6 +180,7 @@ func driveClient(t *testing.T, server string) {
 	c := dial(t, fmt.Sprintf("%s/updateReports?agent=%s", server, url.QueryEscape(agent)))
 	drain(c)
 	c.Close()
+	return n
 }
 
 // caseCount asks the fuzzingserver how many cases it offers, retrying the
@@ -215,8 +225,9 @@ func dial(t *testing.T, rawurl string) *websocket.Conn {
 	return c
 }
 
-// checkReport fails the test for any case the suite reports as FAILED.
-func checkReport(t *testing.T, indexPath string) {
+// checkReport fails the test for any case the suite reports as FAILED, or
+// when the report does not hold all want cases.
+func checkReport(t *testing.T, indexPath string, want int) {
 	data, err := os.ReadFile(indexPath)
 	if err != nil {
 		t.Fatalf("read report: %v", err)
@@ -229,8 +240,8 @@ func checkReport(t *testing.T, indexPath string) {
 		t.Fatalf("parse report: %v", err)
 	}
 	cases := report[agent]
-	if len(cases) == 0 {
-		t.Fatalf("report %s has no cases for agent %q", indexPath, agent)
+	if len(cases) != want {
+		t.Errorf("report %s has %d cases for agent %q, want %d", indexPath, len(cases), agent, want)
 	}
 
 	ids := make([]string, 0, len(cases))
@@ -279,11 +290,42 @@ func caseLess(a, b string) bool {
 	return len(as) < len(bs)
 }
 
-func dockerRun(t *testing.T, args ...string) {
-	cmd := exec.Command("docker", append([]string{"run", "--rm"}, args...)...)
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+// dockerRun runs a named container to completion and returns its combined
+// output. The container is kept until cleanup so copyReports can read its
+// reports.
+func dockerRun(t *testing.T, name string, args ...string) string {
+	exec.Command("docker", "rm", "-f", name).Run() // remove any stale container
+	t.Cleanup(func() { exec.Command("docker", "rm", "-f", name).Run() })
+	var out bytes.Buffer
+	cmd := exec.Command("docker", append([]string{"run", "--name", name}, args...)...)
+	cmd.Stdout = io.MultiWriter(os.Stderr, &out)
+	cmd.Stderr = cmd.Stdout
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("docker run: %v", err)
+	}
+	return out.String()
+}
+
+// copyReports copies the container's reports/<sub> directory to the host and
+// returns the host path.
+//
+// wstest writes inside the container rather than to a bind mount: Docker
+// Desktop's macOS file sharing can fail its writes with EDEADLK ("Resource
+// deadlock avoided"), after which wstest hangs instead of exiting.
+func copyReports(t *testing.T, container, sub string) string {
+	dst := filepath.Join(reportsDir(t), sub)
+	out, err := exec.Command("docker", "cp", container+":/reports/"+sub+"/.", dst).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker cp reports: %v: %s", err, out)
+	}
+	return dst
+}
+
+// clearReports removes reports/<sub> so a failed run cannot be checked
+// against a previous run's results.
+func clearReports(t *testing.T, sub string) {
+	if err := os.RemoveAll(filepath.Join(reportsDir(t), sub)); err != nil {
+		t.Fatal(err)
 	}
 }
 
