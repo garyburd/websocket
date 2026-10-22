@@ -249,7 +249,8 @@ func (c CloseCode) String() string {
 }
 
 // CloseError reports a peer close. Use errors.As to inspect Code and Text.
-// [CloseAbnormalClosure] means the transport ended without a close frame.
+// [CloseAbnormalClosure] means the transport ended between frames without a
+// close frame.
 type CloseError struct {
 	// Code is the peer status, [CloseNoStatusReceived], or
 	// [CloseAbnormalClosure].

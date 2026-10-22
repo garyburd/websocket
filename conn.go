@@ -949,6 +949,11 @@ func (r *Reader) close() error {
 }
 
 // ReadMessage reads and returns one complete message.
+//
+// ReadMessage buffers the whole message in memory. With the default unlimited
+// MaxMessageSize, a peer can make it allocate without bound; set
+// [UpgradeOptions.MaxMessageSize] or [DialOptions.MaxMessageSize] when the
+// peer is untrusted, or stream with [Conn.Read].
 func (c *Conn) ReadMessage(opts *ReadOptions) ([]byte, MessageType, error) {
 	r, err := c.nextReader(opts)
 	if err != nil {
@@ -998,8 +1003,10 @@ func (c *Conn) Write(ctx context.Context, mt MessageType, opts *WriteOptions, fn
 		c.writer.err = err
 		w.close()
 	} else {
+		// close returns the writer failure. Do not read c.writer.err here:
+		// close released writer.mu, and the next writer may already own it.
 		err = w.close()
-		writeErr = c.writer.err
+		writeErr = err
 	}
 	if err != nil {
 		if errors.Is(writeErr, ErrTimeout) {
@@ -1025,6 +1032,11 @@ func (c *Conn) nextWriter(ctx context.Context, mt MessageType, opts *WriteOption
 		opcode = opBinary
 	default:
 		return nil, errInvalidMessageType
+	}
+	// select chooses randomly among ready cases; check ctx first so a done
+	// context never acquires the writer.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %w", errWriteUnstarted, err)
 	}
 	select {
 	case c.writer.mu <- struct{}{}:
@@ -1138,6 +1150,8 @@ func (w *Writer) WriteString(s string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// TODO: avoid the []byte conversions here and below; they copy the
+	// unbuffered remainder of s, which is costly for large strings.
 	if m.final {
 		return w.Write([]byte(s))
 	}

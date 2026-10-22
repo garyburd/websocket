@@ -86,6 +86,9 @@ type UpgradeOptions struct {
 
 	// MaxMessageSize limits one inbound message. Exceeding it sends
 	// [CloseMessageTooBig] and returns [ErrProtocol]. Zero is unlimited.
+	//
+	// Servers should set a limit: with zero, an untrusted client can make
+	// [Conn.ReadMessage] allocate without bound.
 	MaxMessageSize int
 
 	// WriteBufferSize is the per-frame coalescing buffer size. Zero uses 4 KiB;

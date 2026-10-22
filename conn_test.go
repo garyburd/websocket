@@ -767,6 +767,66 @@ func TestWriterReadFromSourceErrorFailsMessage(t *testing.T) {
 	}
 }
 
+// TestConcurrentWriteMessages runs writers in parallel so the race detector
+// sees Conn.Write's post-close bookkeeping overlap the next writer's setup.
+// Every message must arrive whole, as its own single frame.
+func TestConcurrentWriteMessages(t *testing.T) {
+	const writers, perWriter = 8, 50
+	c, peer := connPair(t)
+
+	done := make(chan map[string]int)
+	go func() {
+		seen := make(map[string]int)
+		for range writers * perWriter {
+			f := readPeerFrame(t, peer)
+			if !f.fin || f.opcode != opText {
+				t.Errorf("frame fin=%v opcode=%d, want a single text frame", f.fin, f.opcode)
+			}
+			seen[string(f.payload)]++
+		}
+		done <- seen
+	}()
+
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Go(func() {
+			msg := []byte(fmt.Sprintf("writer-%d", i))
+			for range perWriter {
+				if err := c.WriteMessage(context.Background(), MessageText, nil, msg); err != nil {
+					t.Errorf("WriteMessage: %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	seen := <-done
+	for i := range writers {
+		if n := seen[fmt.Sprintf("writer-%d", i)]; n != perWriter {
+			t.Errorf("writer-%d: got %d messages, want %d", i, n, perWriter)
+		}
+	}
+}
+
+// TestWriteCanceledContextNeverAcquires checks that a done context fails
+// writer acquisition even when the writer is free. Without the explicit
+// check, select picks between the two ready cases at random.
+func TestWriteCanceledContextNeverAcquires(t *testing.T) {
+	c, _ := connPair(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 100 {
+		err := c.Write(ctx, MessageBinary, nil, func(*Writer) error {
+			t.Fatal("callback ran with a canceled context")
+			return nil
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Write err = %v, want context.Canceled", err)
+		}
+	}
+}
+
 func TestWriterReadFromDataWithEOF(t *testing.T) {
 	// A source that returns its final bytes together with io.EOF (the iotest
 	// DataErrReader contract) must not lose that last chunk: ReadFrom adds the
