@@ -1,9 +1,11 @@
 package websocket
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -223,4 +225,14 @@ func TestUpgradeOnErrorRendersCustomResponse(t *testing.T) {
 	if string(got) != body {
 		t.Errorf("body = %q, want %q", got, body)
 	}
+}
+
+// hijackRecorder is a ResponseRecorder whose Hijack returns conn.
+type hijackRecorder struct {
+	*httptest.ResponseRecorder
+	conn net.Conn
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return h.conn, bufio.NewReadWriter(bufio.NewReader(h.conn), bufio.NewWriter(h.conn)), nil
 }

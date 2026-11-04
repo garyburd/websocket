@@ -1,13 +1,20 @@
 package websocket
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -536,26 +543,87 @@ func FuzzRoundTrip(f *testing.F) {
 	})
 }
 
+// upgradeConn is the hijacked connection in FuzzUpgradeHeaders. It records
+// what Upgrade writes and reports EOF on read. Upgrade uses only Read,
+// Write, and Close, so the embedded net.Conn is nil.
+type upgradeConn struct {
+	net.Conn
+	w bytes.Buffer
+}
+
+func (c *upgradeConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (c *upgradeConn) Write(p []byte) (int, error) { return c.w.Write(p) }
+func (c *upgradeConn) Close() error                { return nil }
+
+// owsTokens returns the elements of comma-separated header values, with
+// optional whitespace (RFC 7230 §3.2.3: space and tab) trimmed.
+func owsTokens(values []string) []string {
+	var tokens []string
+	for _, v := range values {
+		for _, t := range strings.Split(v, ",") {
+			tokens = append(tokens, strings.Trim(t, " \t"))
+		}
+	}
+	return tokens
+}
+
+func hasTokenFold(values []string, token string) bool {
+	return slices.ContainsFunc(owsTokens(values), func(t string) bool { return strings.EqualFold(t, token) })
+}
+
+// wantUpgrade states, independently of Upgrade, the status for rejecting r,
+// or 0 to accept it. glob selects the AllowedOrigins(true, "*.example.com")
+// check instead of the default same-host check.
+func wantUpgrade(r *http.Request, glob bool) int {
+	switch {
+	case !hasTokenFold(r.Header.Values("Connection"), "upgrade"),
+		!hasTokenFold(r.Header.Values("Upgrade"), "websocket"),
+		r.Header.Get("Sec-WebSocket-Version") != "13",
+		r.Header.Get("Sec-WebSocket-Key") == "":
+		return http.StatusBadRequest
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return 0
+	}
+	u, err := url.Parse(origin)
+	switch {
+	case err != nil || u.Host == "":
+		return http.StatusForbidden
+	case strings.EqualFold(u.Host, r.Host):
+		return 0
+	case glob:
+		if ok, _ := path.Match("*.example.com", strings.ToLower(u.Host)); ok {
+			return 0
+		}
+	}
+	return http.StatusForbidden
+}
+
 // FuzzUpgradeHeaders drives the server handshake with arbitrary values in
-// every header Upgrade inspects (including the Origin parse behind the
-// default host check and a glob CheckOrigin, and the subprotocol
-// split) and requires it never to panic. Every outcome must be an
-// ErrBadHandshake-wrapping error: a rejection produces one directly, and a
-// handshake good enough to be accepted fails at the hijack, which a
-// ResponseRecorder cannot satisfy.
+// every header Upgrade inspects, with the default host check and with a
+// glob CheckOrigin and subprotocol selection. An independent statement of
+// the rules says whether to accept. A rejection must return ErrBadHandshake
+// with the expected status. An acceptance must write a 101 response that
+// net/http parses, with only the handshake headers, the RFC 6455 accept key
+// for the request's key, and the client's first supported subprotocol.
 func FuzzUpgradeHeaders(f *testing.F) {
 	f.Add("Upgrade", "websocket", "13", "dGhlIHNhbXBsZSBub25jZQ==", "https://example.com", "chat, superchat")
 	f.Add("keep-alive, Upgrade", "WebSocket", "8", "", "http://example.com:8080", "chat")
 	f.Add("upgrade", "websocket\r\nX-Injected: 1", "13", "key", "://bad\x00origin", "a,,b,")
 	f.Add("Upgrade", "websocket", "13", "key", "https://chat.example.com", "superchat") // glob origin match
 	f.Add("", "", "", "", "", "")
+	f.Add("Upgrade", "websocket", "13", "key\r\nX-Injected: 1", "", "x, superchat,chat") // key reflected only as a hash
+	f.Add("\rUpgrAde", "weBsoCket", "13", "0", "", "0")                                  // CR is not optional whitespace
+	f.Add("upgrade\u00a0", "websocket", "13", "key", "", "\tchat\u00a0, superchat\t")    // nor is NBSP; tab is
 
 	check := AllowedOrigins(true, "*.example.com")
 	f.Fuzz(func(t *testing.T, connection, upgrade, version, key, origin, protocols string) {
-		for _, opts := range []*UpgradeOptions{
-			nil, // default host check
-			{CheckOrigin: check, SelectSubprotocol: SupportedSubprotocols("chat", "superchat")},
-		} {
+		for _, glob := range []bool{false, true} {
+			var opts *UpgradeOptions // default host check
+			if glob {
+				opts = &UpgradeOptions{CheckOrigin: check, SelectSubprotocol: SupportedSubprotocols("chat", "superchat")}
+			}
 			r := httptest.NewRequest(http.MethodGet, "/", nil)
 			r.Header.Set("Connection", connection)
 			r.Header.Set("Upgrade", upgrade)
@@ -564,9 +632,54 @@ func FuzzUpgradeHeaders(f *testing.F) {
 			r.Header.Set("Origin", origin)
 			r.Header.Set("Sec-WebSocket-Protocol", protocols)
 
-			_, err := Upgrade(httptest.NewRecorder(), r, opts)
-			if !errors.Is(err, ErrBadHandshake) {
-				t.Fatalf("Upgrade = %v, want an ErrBadHandshake-wrapping error", err)
+			rec, conn := httptest.NewRecorder(), &upgradeConn{}
+			c, err := Upgrade(&hijackRecorder{rec, conn}, r, opts)
+			if status := wantUpgrade(r, glob); status != 0 {
+				if c != nil {
+					c.Close()
+					t.Fatalf("glob=%v: Upgrade accepted, want status %d", glob, status)
+				}
+				if !errors.Is(err, ErrBadHandshake) || rec.Code != status {
+					t.Fatalf("glob=%v: Upgrade = %v with status %d, want ErrBadHandshake with %d", glob, err, rec.Code, status)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("glob=%v: Upgrade = %v, want success", glob, err)
+			}
+			c.Close()
+
+			raw := conn.w.Bytes()
+			resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), r)
+			if err != nil {
+				t.Fatalf("glob=%v: parse 101 response %q: %v", glob, raw, err)
+			}
+			sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+			var wantProto string
+			if glob {
+				for _, p := range owsTokens(r.Header.Values("Sec-WebSocket-Protocol")) {
+					if p == "chat" || p == "superchat" {
+						wantProto = p
+						break
+					}
+				}
+			}
+			switch {
+			case resp.StatusCode != http.StatusSwitchingProtocols:
+				t.Fatalf("glob=%v: status %d, want 101", glob, resp.StatusCode)
+			case resp.Header.Get("Upgrade") != "websocket" || resp.Header.Get("Connection") != "Upgrade":
+				t.Fatalf("glob=%v: Upgrade %q, Connection %q", glob, resp.Header.Get("Upgrade"), resp.Header.Get("Connection"))
+			case resp.Header.Get("Sec-WebSocket-Accept") != base64.StdEncoding.EncodeToString(sum[:]):
+				t.Fatalf("glob=%v: Sec-WebSocket-Accept %q is wrong for key %q", glob, resp.Header.Get("Sec-WebSocket-Accept"), key)
+			case resp.Header.Get("Sec-WebSocket-Protocol") != wantProto:
+				t.Fatalf("glob=%v: subprotocol %q, want %q for offer %q", glob, resp.Header.Get("Sec-WebSocket-Protocol"), wantProto, protocols)
+			}
+			for k := range resp.Header {
+				switch k {
+				case "Upgrade", "Connection", "Sec-Websocket-Accept", "Sec-Websocket-Protocol":
+				default:
+					t.Fatalf("glob=%v: unexpected response header %q in %q", glob, k, raw)
+				}
 			}
 		}
 	})
