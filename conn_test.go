@@ -1156,29 +1156,90 @@ func TestManualCloseResponse(t *testing.T) {
 	<-done
 }
 
-func TestShutdownRejectsInvalidArgument(t *testing.T) {
-	// An invalid argument is rejected before anything reaches the wire, so one
-	// conn serves all cases. The codes are receive-only, reserved-range, and
-	// out-of-range (full classification in TestValidWireCloseCode); the reason
-	// must be valid UTF-8 (RFC 6455 §8.1).
-	c, _ := connPair(t)
-	for _, tc := range []struct {
-		name    string
-		code    CloseCode
-		reason  string
-		wantErr error
-	}{
-		{"NoStatusReceived", CloseNoStatusReceived, "", errInvalidCloseCode},
-		{"AbnormalClosure", CloseAbnormalClosure, "", errInvalidCloseCode},
-		{"BelowRange", 999, "", errInvalidCloseCode},
-		{"ReservedRange", 1016, "", errInvalidCloseCode},
-		{"PrivateBelowRange", 2999, "", errInvalidCloseCode},
-		{"AboveRange", 5000, "", errInvalidCloseCode},
-		{"InvalidReasonUTF8", CloseNormalClosure, "\xff\xfe", errInvalidCloseReason},
-	} {
-		if err := c.Shutdown(tc.code, tc.reason); !errors.Is(err, tc.wantErr) {
-			t.Errorf("%s: Shutdown(%d, %q) = %v, want %v", tc.name, tc.code, tc.reason, err, tc.wantErr)
+// invalidCloseCases are close arguments that cannot be sent as given and the
+// close a peer must receive instead: an invalid argument must not leave the
+// peer without a close frame (it would see 1006). The codes are
+// receive-only, reserved-range, and out-of-range (full classification in
+// TestValidWireCloseCode); the reason must be valid UTF-8 (RFC 6455 §8.1).
+// CloseNoStatusReceived is sent as a close without a status, so only a reason
+// alongside it is replaced. A nil wantErrs means nothing was replaced, and
+// wantCode CloseNoStatusReceived means an empty close payload.
+var invalidCloseCases = []struct {
+	name       string
+	code       CloseCode
+	reason     string
+	wantErrs   []error
+	wantCode   CloseCode
+	wantReason string
+}{
+	{"NoStatusReceived", CloseNoStatusReceived, "", nil, CloseNoStatusReceived, ""},
+	{"NoStatusReceivedReason", CloseNoStatusReceived, "bye", []error{errCloseReasonDropped}, CloseNoStatusReceived, ""},
+	{"AbnormalClosure", CloseAbnormalClosure, "", []error{errInvalidCloseCode}, CloseInternalError, ""},
+	{"BelowRange", 999, "", []error{errInvalidCloseCode}, CloseInternalError, ""},
+	{"ReservedRange", 1016, "", []error{errInvalidCloseCode}, CloseInternalError, ""},
+	{"PrivateBelowRange", 2999, "", []error{errInvalidCloseCode}, CloseInternalError, ""},
+	{"AboveRange", 5000, "", []error{errInvalidCloseCode}, CloseInternalError, ""},
+	{"InvalidReasonUTF8", CloseNormalClosure, "a\xff\xfeb", []error{errInvalidCloseReason}, CloseNormalClosure, "a\uFFFDb"},
+	{"Both", 5000, "\xff", []error{errInvalidCloseCode, errInvalidCloseReason}, CloseInternalError, "\uFFFD"},
+}
+
+// checkInvalidCloseResult checks the error and the close frame the peer got
+// for one invalidCloseCases entry.
+func checkInvalidCloseResult(t *testing.T, err error, code CloseCode, reason string, wantErrs []error, f peerFrame, wantCode CloseCode, wantReason string) {
+	t.Helper()
+	switch {
+	case len(wantErrs) == 0:
+		if err != nil {
+			t.Errorf("(%d, %q) = %v, want nil", code, reason, err)
 		}
+	case !errors.Is(err, ErrCloseArgsReplaced):
+		t.Errorf("(%d, %q) = %v, want ErrCloseArgsReplaced", code, reason, err)
+	case errors.Is(err, ErrInvalidArgument):
+		// The close was sent, so the call did not leave the connection untouched.
+		t.Errorf("(%d, %q) = %v, matches ErrInvalidArgument", code, reason, err)
+	}
+	for _, want := range wantErrs {
+		if !errors.Is(err, want) {
+			t.Errorf("(%d, %q) = %v, want %v", code, reason, err, want)
+		}
+	}
+	if err != nil && !strings.Contains(err.Error(), "sent") {
+		t.Errorf("error %q does not say the close was sent", err)
+	}
+	if f.opcode != opClose {
+		t.Fatalf("peer got %+v, want a close frame", f)
+	}
+	if wantCode == CloseNoStatusReceived {
+		if len(f.payload) != 0 {
+			t.Errorf("peer got close payload %q, want empty", f.payload)
+		}
+		return
+	}
+	if len(f.payload) < 2 {
+		t.Fatalf("peer got %+v, want a close frame with a code", f)
+	}
+	got := CloseCode(binary.BigEndian.Uint16(f.payload))
+	if got != wantCode || string(f.payload[2:]) != wantReason {
+		t.Errorf("peer got close {%d %q}, want {%d %q}", got, f.payload[2:], wantCode, wantReason)
+	}
+}
+
+func TestShutdownInvalidArgumentSendsClose(t *testing.T) {
+	for _, tc := range invalidCloseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, peer := connPair(t)
+			// Fail, not hang, if no close is sent.
+			peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+			got := make(chan peerFrame, 1)
+			go func() { got <- readPeerFrame(t, peer) }()
+
+			err := c.Shutdown(tc.code, tc.reason)
+			checkInvalidCloseResult(t, err, tc.code, tc.reason, tc.wantErrs, <-got, tc.wantCode, tc.wantReason)
+			// The substitute close counts as sent.
+			if err := c.WriteMessage(context.Background(), MessageText, nil, []byte("x")); !errors.Is(err, ErrCloseSent) {
+				t.Errorf("WriteMessage after Shutdown = %v, want ErrCloseSent", err)
+			}
+		})
 	}
 }
 
@@ -1193,6 +1254,10 @@ func TestAfterShutdown(t *testing.T) {
 	}
 	if err := c.Shutdown(CloseNormalClosure, ""); err != nil {
 		t.Errorf("second Shutdown: %v, want nil", err)
+	}
+	// No close is sent, so there is no substitution to report.
+	if err := c.Shutdown(CloseAbnormalClosure, "\xff"); err != nil {
+		t.Errorf("Shutdown with invalid arguments after close: %v, want nil", err)
 	}
 	err := c.WriteMessage(context.Background(), MessageText, nil, []byte("nope"))
 	if !errors.Is(err, ErrCloseSent) {

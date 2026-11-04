@@ -203,7 +203,9 @@ func readHeader(r io.Reader, isServer bool) (frameHeader, error) {
 
 // CloseCode is an RFC 6455 close status code.
 //
-// [CloseNoStatusReceived] and [CloseAbnormalClosure] are receive-only.
+// [CloseAbnormalClosure] is receive-only. [CloseNoStatusReceived] is never
+// sent as a code: [Conn.Shutdown] sends it as a close frame with an empty
+// payload.
 type CloseCode int
 
 const (

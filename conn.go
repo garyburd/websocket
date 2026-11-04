@@ -11,6 +11,7 @@ import (
 	"math/bits"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,11 +74,18 @@ var (
 	// remains usable.
 	ErrInvalidArgument = errors.New("websocket: invalid argument")
 
+	// ErrCloseArgsReplaced reports that [Conn.Shutdown] replaced a close code
+	// or reason that cannot be sent. Unlike [ErrInvalidArgument], the call has
+	// taken effect: the close was sent with the replacement, which the error
+	// describes.
+	ErrCloseArgsReplaced = errors.New("websocket: close arguments replaced")
+
 	errReaderScope        = fmt.Errorf("%w: reader used after close", ErrInvalidArgument)
 	errWriterScope        = fmt.Errorf("%w: writer used after close", ErrInvalidArgument)
 	errReaderAborted      = fmt.Errorf("%w: reader aborted", ErrClosed)
-	errInvalidCloseCode   = fmt.Errorf("%w: close code not allowed on a close frame", ErrInvalidArgument)
-	errInvalidCloseReason = fmt.Errorf("%w: close reason is not valid UTF-8", ErrInvalidArgument)
+	errInvalidCloseCode   = fmt.Errorf("%w: close code not allowed on a close frame", ErrCloseArgsReplaced)
+	errInvalidCloseReason = fmt.Errorf("%w: close reason is not valid UTF-8", ErrCloseArgsReplaced)
+	errCloseReasonDropped = fmt.Errorf("%w: close reason requires a status code", ErrCloseArgsReplaced)
 	errInvalidMessageType = fmt.Errorf("%w: message type must be MessageText or MessageBinary", ErrInvalidArgument)
 
 	errWriteTimeout = fmt.Errorf("%w: write timeout", ErrTimeout)
@@ -1310,24 +1318,47 @@ func (c *Conn) handleControlFrame(h frameHeader) error {
 	}
 }
 
+// closePayload builds a sendable close payload from code and reason for
+// Shutdown. [CloseNoStatusReceived] becomes an empty payload, the wire form
+// of "no status". If anything is replaced or dropped, err matches
+// [ErrCloseArgsReplaced] and says what is sent instead.
+func closePayload(code CloseCode, reason string) (_ []byte, err error) {
+	if code == CloseNoStatusReceived {
+		if reason != "" {
+			err = fmt.Errorf("%w; sent a close without status or reason", errCloseReasonDropped)
+		}
+		return nil, err
+	}
+	if !validWireCloseCode(code) {
+		err = fmt.Errorf("%w (%d); sent %d instead", errInvalidCloseCode, code, CloseInternalError)
+		code = CloseInternalError
+	}
+	if !utf8.ValidString(reason) {
+		err = errors.Join(err, fmt.Errorf("%w; sent it with U+FFFD replacements", errInvalidCloseReason))
+		reason = strings.ToValidUTF8(reason, "\uFFFD")
+	}
+	return buildClosePayload(code, reason), err
+}
+
 // Shutdown sends a close frame and returns without waiting for the response.
 // Continue reading, then call [Conn.Close]. A message the peer is still
 // sending may be cut off; read any inbound message you need to completion
 // first.
 //
-// An invalid code or invalid UTF-8 in reason returns [ErrInvalidArgument]. The
-// reason is truncated to 123 bytes at a rune boundary.
+// The reason is truncated to 123 bytes at a rune boundary.
+// [CloseNoStatusReceived] sends a close frame without a status code or
+// reason. Any other code that cannot be sent is sent as [CloseInternalError],
+// and each run of invalid UTF-8 in reason as U+FFFD; the close is still sent,
+// and Shutdown then returns an error matching [ErrCloseArgsReplaced] that
+// describes the substitution.
 //
 // [DialOptions.ShutdownTimeout] or [UpgradeOptions.ShutdownTimeout] bounds both
 // sending and waiting. Expiry tears down the connection with [ErrTimeout].
-// Shutdown is safe for concurrent use and is a no-op when closing has begun.
+// Shutdown is safe for concurrent use and is a no-op, returning nil, when
+// closing has begun.
 func (c *Conn) Shutdown(code CloseCode, reason string) error {
-	if !validWireCloseCode(code) {
-		return errInvalidCloseCode
-	}
-	if !utf8.ValidString(reason) {
-		return errInvalidCloseReason
-	}
+	// The peer gets a valid close either way; argErr reports what was sent.
+	payload, argErr := closePayload(code, reason)
 	if c.loadTerminalErr() != nil {
 		return nil
 	}
@@ -1337,7 +1368,7 @@ func (c *Conn) Shutdown(code CloseCode, reason string) error {
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
-	err := c.writeControlFrame(opClose, buildClosePayload(code, reason), deadline)
+	err := c.writeControlFrame(opClose, payload, deadline)
 	if errors.Is(err, ErrCloseSent) {
 		return nil
 	}
@@ -1354,14 +1385,14 @@ func (c *Conn) Shutdown(code CloseCode, reason string) error {
 	if timeout != 0 {
 		if !deadline.After(time.Now()) {
 			c.terminateConn(errShutdownTimeout)
-			return nil
+			return argErr
 		}
 		c.shutdownTimer.Reset(time.Until(deadline))
 		if c.loadTerminalErr() != nil {
 			c.shutdownTimer.Stop()
 		}
 	}
-	return nil
+	return argErr
 }
 
 // onShutdownTimer terminates an overdue close handshake. No stale guard: the
