@@ -43,45 +43,224 @@ func fuzzConn(rwc *sinkRWC, isServer bool, bufSize int) *Conn {
 	})
 }
 
-// FuzzReadInbound feeds arbitrary bytes to the read path and requires it never
-// to panic, never to overrun MaxMessageSize, and to terminate. Each input is
-// decoded both as a server (masked client frames expected) and as a client
-// (unmasked server frames expected) to cover both mask disciplines.
+// inboundRWC serves r and records everything the Conn writes.
+type inboundRWC struct {
+	r io.Reader
+	w bytes.Buffer
+}
+
+func (c *inboundRWC) Read(p []byte) (int, error)  { return c.r.Read(p) }
+func (c *inboundRWC) Write(p []byte) (int, error) { return c.w.Write(p) }
+func (c *inboundRWC) Close() error                { return nil }
+
+// inboundMessage is one data message.
+type inboundMessage struct {
+	mt      MessageType
+	payload []byte
+}
+
+// inboundReference is what a conforming reader does with a frame sequence,
+// up to its first violation that does not depend on read options or
+// message content.
+type inboundReference struct {
+	messages   []inboundMessage // complete messages, in order
+	pings      [][]byte         // ping payloads, in order
+	peerClose  []byte           // the close frame's payload; nil if none
+	closeFound bool
+}
+
+func referenceInbound(frames []wireFrame) inboundReference {
+	var ref inboundReference
+	var cur *inboundMessage
+	for _, f := range frames {
+		if f.opcode&8 != 0 {
+			if !f.fin || len(f.payload) > maxControlPayload {
+				return ref
+			}
+			switch f.opcode {
+			case opPing:
+				ref.pings = append(ref.pings, f.payload)
+			case opPong:
+			case opClose:
+				ref.peerClose, ref.closeFound = f.payload, true
+				return ref
+			default:
+				return ref
+			}
+			continue
+		}
+		switch {
+		case cur == nil && (f.opcode == opText || f.opcode == opBinary):
+			mt := MessageBinary
+			if f.opcode == opText {
+				mt = MessageText
+			}
+			cur = &inboundMessage{mt: mt, payload: []byte{}}
+		case cur != nil && f.opcode == opContinuation:
+		default:
+			return ref
+		}
+		cur.payload = append(cur.payload, f.payload...)
+		if f.fin {
+			ref.messages = append(ref.messages, *cur)
+			cur = nil
+		}
+	}
+	return ref
+}
+
+// FuzzReadInbound feeds arbitrary bytes to the read path, as a server
+// (masked client frames expected) and as a client (unmasked server frames
+// expected), under several read options. An independent decoder of the
+// input says what a conforming reader does, and the test checks the
+// messages returned, the frames the Conn writes back, and the terminal
+// error against it:
+//
+//   - the messages are a prefix of the input's complete messages, and all
+//     of them when the input simply runs out;
+//   - only well-formed control frames are written: pongs echo the input's
+//     pings in order, and at most one close, last;
+//   - a protocol error sends a close with its code, a peer close is echoed
+//     with its payload, and running out of input sends no close;
+//   - the error is sticky.
 func FuzzReadInbound(f *testing.F) {
 	f.Add([]byte{0x81, 0x05, 'h', 'e', 'l', 'l', 'o'})          // text "hello" (unmasked)
 	f.Add([]byte{0x88, 0x02, 0x03, 0xe8})                       // close, code 1000
 	f.Add([]byte{0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i'}) // masked text "hi", zero key
 	f.Add([]byte{0x82, 0x7e, 0x01, 0x00})                       // binary, 256-byte len header, truncated
 	f.Add([]byte{0x01, 0x03, 'a', 'b', 'c', 0x80, 0x02, 'd', 'e'})
-	f.Add([]byte{0x88, 0x04, 0x03, 0xe8, 0xff, 0xfe})                         // close, code 1000, invalid UTF-8 reason
-	f.Add([]byte{0x88, 0x84, 0x01, 0x02, 0x03, 0x04, 0x02, 0xea, 0xfc, 0xfa}) // same close, masked (server mode)
-	f.Add([]byte{0x01, 0x02, 'h', 'i', 0x8a, 0x00, 0x80, 0x01, '!'})          // pong interleaved between text fragments
-	f.Add([]byte{0x89, 0x80, 0x01, 0x02, 0x03, 0x04})                         // masked ping, empty payload
-	f.Add([]byte{0xc1, 0x00})                                                 // RSV1 set
-	f.Add([]byte{0x09, 0x00})                                                 // fragmented (FIN=0) ping
-	f.Add([]byte{0x81, 0x7e, 0x00, 0x7d})                                     // 16-bit length 125: non-minimal encoding
-	f.Add([]byte{0x81, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) // 64-bit length with MSB set
+	f.Add([]byte{0x88, 0x04, 0x03, 0xe8, 0xff, 0xfe})                          // close, code 1000, invalid UTF-8 reason
+	f.Add([]byte{0x88, 0x84, 0x01, 0x02, 0x03, 0x04, 0x02, 0xea, 0xfc, 0xfa})  // same close, masked (server mode)
+	f.Add([]byte{0x01, 0x02, 'h', 'i', 0x8a, 0x00, 0x80, 0x01, '!'})           // pong interleaved between text fragments
+	f.Add([]byte{0x89, 0x80, 0x01, 0x02, 0x03, 0x04})                          // masked ping, empty payload
+	f.Add([]byte{0xc1, 0x00})                                                  // RSV1 set
+	f.Add([]byte{0x09, 0x00})                                                  // fragmented (FIN=0) ping
+	f.Add([]byte{0x81, 0x7e, 0x00, 0x7d})                                      // 16-bit length 125: non-minimal encoding
+	f.Add([]byte{0x81, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})  // 64-bit length with MSB set
+	f.Add([]byte{0x89, 0x02, 'p', '1', 0x81, 0x01, 'a', 0x89, 0x02, 'p', '2'}) // pings around a message
+	f.Add([]byte{0x81, 0x02, 0xc3, 0x28})                                      // invalid UTF-8 text
+	f.Add(append([]byte{0x82, 0x7e, 0x00, 0x80}, make([]byte, 128)...))        // 128-byte binary, over the 64-byte limit
 
+	variants := []struct {
+		name       string
+		opts       *ReadOptions
+		maxMsg     int
+		mayTimeout bool // MinReadRate's watchdog may fire if the fuzzer stalls
+	}{
+		{"default", nil, 1 << 20, false},
+		{"skipUTF8", &ReadOptions{SkipUTF8Validation: true, MatchPong: true, MinReadRate: 1}, 1 << 20, true},
+		{"limit64", nil, 64, false},
+	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		for _, isServer := range []bool{false, true} {
-			c := fuzzConn(&sinkRWC{r: bytes.NewReader(data)}, isServer, 4096)
-			for {
-				msg, _, err := c.ReadMessage(nil)
-				if len(msg) > 1<<20 {
-					t.Fatalf("isServer=%v: message len %d exceeds MaxMessageSize", isServer, len(msg))
+			in, _ := parseWire(data, isServer)
+			ref := referenceInbound(in)
+			for _, v := range variants {
+				rwc := &inboundRWC{r: bytes.NewReader(data)}
+				c := newConn(rwc, nil, connConfig{
+					isServer:            isServer,
+					controlReplyTimeout: time.Hour,
+					shutdownTimeout:     time.Hour,
+					maxMessageSize:      v.maxMsg,
+					writeBufferSize:     4096,
+				})
+				var got []inboundMessage
+				var err error
+				for {
+					var msg []byte
+					var mt MessageType
+					if msg, mt, err = c.ReadMessage(v.opts); err != nil {
+						break
+					}
+					got = append(got, inboundMessage{mt, msg})
 				}
-				if err != nil {
-					break
+				if _, _, err2 := c.ReadMessage(v.opts); err2 == nil {
+					t.Fatalf("isServer=%v %s: ReadMessage succeeded after a terminal read error", isServer, v.name)
+				}
+				c.Close() // stop the connection's timers; don't leak an AfterFunc per iteration
+				if cerr := checkInbound(ref, got, rwc.w.Bytes(), err, isServer, v.opts, v.maxMsg, v.mayTimeout); cerr != nil {
+					t.Fatalf("isServer=%v %s: %v (read error: %v)", isServer, v.name, cerr, err)
 				}
 			}
-			// The error must be sticky: once a read fails, every later read
-			// must fail too, never hand back a message.
-			if _, _, err := c.ReadMessage(nil); err == nil {
-				t.Fatalf("isServer=%v: ReadMessage succeeded after a terminal read error", isServer)
-			}
-			c.Close() // stop the connection's timers; don't leak an AfterFunc per iteration
 		}
 	})
+}
+
+// checkInbound checks one FuzzReadInbound run against the reference.
+func checkInbound(ref inboundReference, got []inboundMessage, out []byte, readErr error, isServer bool, opts *ReadOptions, maxMsg int, mayTimeout bool) error {
+	validate := opts == nil || !opts.SkipUTF8Validation
+	if len(got) > len(ref.messages) {
+		return fmt.Errorf("returned %d messages, input has %d", len(got), len(ref.messages))
+	}
+	for i, m := range got {
+		want := ref.messages[i]
+		switch {
+		case m.mt != want.mt || !bytes.Equal(m.payload, want.payload):
+			return fmt.Errorf("message %d = %v %q, want %v %q", i, m.mt, m.payload, want.mt, want.payload)
+		case len(m.payload) > maxMsg:
+			return fmt.Errorf("message %d is %d bytes, over MaxMessageSize %d", i, len(m.payload), maxMsg)
+		case validate && m.mt == MessageText && !utf8.Valid(m.payload):
+			return fmt.Errorf("message %d is invalid UTF-8 text", i)
+		}
+	}
+
+	// The Conn masks iff it is a client.
+	frames, err := parseWire(out, !isServer)
+	if err != nil {
+		return fmt.Errorf("written frames: %v", err)
+	}
+	var pongs [][]byte
+	var sentClose []byte
+	for i, f := range frames {
+		switch {
+		case !f.fin || len(f.payload) > maxControlPayload:
+			return fmt.Errorf("wrote invalid control frame %+v", f)
+		case f.opcode == opPong && sentClose == nil:
+			pongs = append(pongs, f.payload)
+		case f.opcode == opClose && i == len(frames)-1:
+			sentClose = f.payload
+		default:
+			return fmt.Errorf("wrote unexpected frame %d of %d: opcode %d", i, len(frames), f.opcode)
+		}
+	}
+	if len(pongs) > len(ref.pings) {
+		return fmt.Errorf("sent %d pongs for %d pings", len(pongs), len(ref.pings))
+	}
+	for i, p := range pongs {
+		if !bytes.Equal(p, ref.pings[i]) {
+			return fmt.Errorf("pong %d = %q, want ping payload %q", i, p, ref.pings[i])
+		}
+	}
+
+	// complete requires everything before the end of input was handled.
+	complete := func() error {
+		if len(got) != len(ref.messages) || len(pongs) != len(ref.pings) {
+			return fmt.Errorf("handled %d of %d messages and %d of %d pings", len(got), len(ref.messages), len(pongs), len(ref.pings))
+		}
+		return nil
+	}
+	var pe *protocolError
+	var ce *CloseError
+	switch {
+	case errors.As(readErr, &pe):
+		if len(sentClose) < 2 || CloseCode(sentClose[0])<<8|CloseCode(sentClose[1]) != pe.code {
+			return fmt.Errorf("protocol error %d, sent close %q", pe.code, sentClose)
+		}
+	case errors.As(readErr, &ce) && ce.Code == CloseAbnormalClosure, errors.Is(readErr, io.ErrUnexpectedEOF):
+		if sentClose != nil {
+			return fmt.Errorf("input ran out, sent close %q", sentClose)
+		}
+		return complete()
+	case errors.As(readErr, &ce):
+		if !ref.closeFound || !bytes.Equal(sentClose, ref.peerClose) {
+			return fmt.Errorf("peer close %q, sent close %q", ref.peerClose, sentClose)
+		}
+		return complete()
+	case mayTimeout && errors.Is(readErr, ErrTimeout):
+	default:
+		return fmt.Errorf("unexpected read error type %T", readErr)
+	}
+	return nil
 }
 
 // chunkReader limits each Read to the next size in plan, 1 to 256 bytes,
@@ -110,52 +289,52 @@ type wireFrame struct {
 
 // parseWire decodes the frames in b independently of the package's parser.
 // masked requires client masking and removes it; otherwise frames must be
-// unmasked.
+// unmasked. On error it also returns the frames decoded before it.
 func parseWire(b []byte, masked bool) ([]wireFrame, error) {
 	var frames []wireFrame
 	for len(b) > 0 {
 		if len(b) < 2 {
-			return nil, errors.New("truncated header")
+			return frames, errors.New("truncated header")
 		}
 		f := wireFrame{fin: b[0]&0x80 != 0, opcode: int(b[0] & 0x0f)}
 		if b[0]&0x70 != 0 {
-			return nil, errors.New("RSV bits set")
+			return frames, errors.New("RSV bits set")
 		}
 		if got := b[1]&0x80 != 0; got != masked {
-			return nil, fmt.Errorf("mask bit %v, want %v", got, masked)
+			return frames, fmt.Errorf("mask bit %v, want %v", got, masked)
 		}
 		n, rest := uint64(b[1]&0x7f), b[2:]
 		switch n {
 		case 126:
 			if len(rest) < 2 {
-				return nil, errors.New("truncated 16-bit length")
+				return frames, errors.New("truncated 16-bit length")
 			}
 			if n = uint64(rest[0])<<8 | uint64(rest[1]); n < 126 {
-				return nil, errors.New("non-minimal 16-bit length")
+				return frames, errors.New("non-minimal 16-bit length")
 			}
 			rest = rest[2:]
 		case 127:
 			if len(rest) < 8 {
-				return nil, errors.New("truncated 64-bit length")
+				return frames, errors.New("truncated 64-bit length")
 			}
 			n = 0
 			for _, c := range rest[:8] {
 				n = n<<8 | uint64(c)
 			}
 			if n <= 0xffff || n>>63 != 0 {
-				return nil, errors.New("invalid 64-bit length")
+				return frames, errors.New("invalid 64-bit length")
 			}
 			rest = rest[8:]
 		}
 		var key []byte
 		if masked {
 			if len(rest) < 4 {
-				return nil, errors.New("truncated mask key")
+				return frames, errors.New("truncated mask key")
 			}
 			key, rest = rest[:4], rest[4:]
 		}
 		if uint64(len(rest)) < n {
-			return nil, errors.New("truncated payload")
+			return frames, errors.New("truncated payload")
 		}
 		f.payload = bytes.Clone(rest[:n])
 		for i := range key {
