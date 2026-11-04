@@ -468,11 +468,9 @@ func (c *Conn) onFrameTimer() {
 	c.terminateConn(errWriteTimeout)
 }
 
-// writeControlFrame writes one control frame before deadline.
+// writeControlFrame writes one control frame before deadline. payload is at
+// most maxControlPayload bytes.
 func (c *Conn) writeControlFrame(op int, payload []byte, deadline time.Time) error {
-	if len(payload) > maxControlPayload {
-		return fmt.Errorf("websocket: control payload too large (%d)", len(payload))
-	}
 	return c.writeFrame(op, true, c.frame.control[:maxHeaderLen], payload, deadline)
 }
 
