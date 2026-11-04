@@ -75,9 +75,11 @@ var (
 	ErrInvalidArgument = errors.New("websocket: invalid argument")
 
 	// ErrCloseArgsReplaced reports that [Conn.Shutdown] or [Reader.Abort]
-	// replaced a close code or reason that cannot be sent. Unlike
-	// [ErrInvalidArgument], the call has taken effect: the close was sent with
-	// the replacement, which the error describes.
+	// replaced arguments that cannot be sent on a close frame: an invalid code
+	// is sent as [CloseInternalError], each run of invalid UTF-8 in the reason
+	// as U+FFFD, and a reason given with [CloseNoStatusReceived] is dropped.
+	// The error says what was sent. Unlike [ErrInvalidArgument], the call has
+	// taken effect.
 	ErrCloseArgsReplaced = errors.New("websocket: close arguments replaced")
 
 	errReaderScope        = fmt.Errorf("%w: reader used after close", ErrInvalidArgument)
@@ -831,13 +833,10 @@ func (r *Reader) SetReadDeadline(t time.Time) error {
 // Abort stops reading without draining the current message and sends a
 // best-effort close with code and reason.
 //
-// The reason is truncated to 123 bytes at a rune boundary.
-// [CloseNoStatusReceived] sends a close frame without a status code or
-// reason. Any other code that cannot be sent is sent as [CloseInternalError],
-// and each run of invalid UTF-8 in reason as U+FFFD; Abort still aborts, and
-// if the close is sent it returns an error matching [ErrCloseArgsReplaced]
-// that describes the substitution. After Abort, [Conn.Read] returns the
-// callback error or [ErrClosed].
+// The reason is truncated to 123 bytes at a rune boundary. Arguments that
+// cannot be sent are replaced as described at [ErrCloseArgsReplaced]; Abort
+// still aborts and, if the close is sent, returns that error. After Abort,
+// [Conn.Read] returns the callback error or [ErrClosed].
 func (r *Reader) Abort(code CloseCode, reason string) error {
 	c := r.c
 	if c == nil {
@@ -880,8 +879,6 @@ func closePayload(code CloseCode, reason string) (_ []byte, err error) {
 }
 
 // Read reads message payload and returns [io.EOF] at the message boundary.
-// Like any [io.Reader], it may return fewer than len(p) bytes: it returns the
-// payload that has arrived rather than waiting for more.
 func (r *Reader) Read(p []byte) (int, error) {
 	c := r.c
 	if c == nil {
@@ -916,20 +913,16 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if m.rateMode {
 		c.monitor.beginFill(want)
 	}
-	// Return what has arrived rather than waiting to fill p, so a stalled
-	// frame's payload is delivered, and invalid text rejected, as it arrives.
 	n, err := c.br.Read(p[:want])
 	if c.isServer && m.maskKey != ([4]byte{}) {
 		m.maskPos = maskCopy(p[:n], p[:n], m.maskKey, m.maskPos)
 	}
 	m.remaining -= n
 	if err != nil && m.remaining == 0 {
-		// The frame's payload is complete. As with io.ReadFull, an error
-		// returned with the last bytes is left to the next read.
+		// The frame is complete; report err on the next read.
 		err = nil
 	}
-	// Validate before handling a read error, so text returned alongside one
-	// has been checked too. Rejected text is not returned at all.
+	// Validate first: bytes returned with an error must be valid too.
 	if m.validateUTF8 && m.opcode == opText {
 		m.utf8State = utf8Validate(m.utf8State, p[:n])
 		if m.utf8State == utf8Reject {
@@ -1361,19 +1354,15 @@ func (c *Conn) handleControlFrame(h frameHeader) error {
 // sending may be cut off; read any inbound message you need to completion
 // first.
 //
-// The reason is truncated to 123 bytes at a rune boundary.
-// [CloseNoStatusReceived] sends a close frame without a status code or
-// reason. Any other code that cannot be sent is sent as [CloseInternalError],
-// and each run of invalid UTF-8 in reason as U+FFFD; the close is still sent,
-// and Shutdown then returns an error matching [ErrCloseArgsReplaced] that
-// describes the substitution.
+// The reason is truncated to 123 bytes at a rune boundary. Arguments that
+// cannot be sent are replaced as described at [ErrCloseArgsReplaced]; the
+// close is still sent, and Shutdown returns that error.
 //
 // [DialOptions.ShutdownTimeout] or [UpgradeOptions.ShutdownTimeout] bounds both
 // sending and waiting. Expiry tears down the connection with [ErrTimeout].
 // Shutdown is safe for concurrent use and is a no-op, returning nil, when
 // closing has begun.
 func (c *Conn) Shutdown(code CloseCode, reason string) error {
-	// The peer gets a valid close either way; argErr reports what was sent.
 	payload, argErr := closePayload(code, reason)
 	if c.loadTerminalErr() != nil {
 		return nil

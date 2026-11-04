@@ -36,8 +36,7 @@ func generateChallengeKey() string {
 }
 
 // trimOWS removes optional whitespace (RFC 7230 §3.2.3): spaces and tabs
-// only, as net/http does. strings.TrimSpace would also accept other control
-// and Unicode space characters around a token.
+// only, as net/http does.
 func trimOWS(s string) string { return strings.Trim(s, " \t") }
 
 // tokenListHas searches comma-separated header values case-insensitively.
@@ -159,9 +158,7 @@ func peekFrame(br *bufio.Reader, n int) ([]byte, error) {
 	return p, err
 }
 
-// readHeader parses and validates one frame header. It peeks at the header
-// in br's buffer rather than copying it out, so it does not allocate. Each
-// field is validated as soon as it arrives, without waiting for the rest.
+// readHeader parses and validates one frame header.
 func readHeader(br *bufio.Reader, isServer bool) (frameHeader, error) {
 	p, err := peekFrame(br, 2)
 	if err != nil {
