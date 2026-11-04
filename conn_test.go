@@ -1243,6 +1243,34 @@ func TestShutdownInvalidArgumentSendsClose(t *testing.T) {
 	}
 }
 
+func TestReaderAbortInvalidArgumentSendsClose(t *testing.T) {
+	for _, tc := range invalidCloseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, peer := connPair(t)
+			abortErr := make(chan error, 1)
+			readErr := make(chan error, 1)
+			go func() {
+				readErr <- c.Read(nil, func(r *Reader) error {
+					abortErr <- r.Abort(tc.code, tc.reason)
+					return nil
+				})
+			}()
+			// Start a message but do not send its payload, so only an
+			// aborted Reader lets Read return.
+			if _, err := peer.Write([]byte{0x82, 0x05}); err != nil {
+				t.Fatalf("peer write header: %v", err)
+			}
+			// Fail, not hang, if no close is sent.
+			peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+			f := readPeerFrame(t, peer)
+			checkInvalidCloseResult(t, <-abortErr, tc.code, tc.reason, tc.wantErrs, f, tc.wantCode, tc.wantReason)
+			if err := <-readErr; !errors.Is(err, ErrClosed) {
+				t.Errorf("Read err = %v, want ErrClosed", err)
+			}
+		})
+	}
+}
+
 func TestAfterShutdown(t *testing.T) {
 	// Once our close is out, a second Shutdown is a no-op and a data write
 	// is rejected with ErrCloseSent.

@@ -74,10 +74,10 @@ var (
 	// remains usable.
 	ErrInvalidArgument = errors.New("websocket: invalid argument")
 
-	// ErrCloseArgsReplaced reports that [Conn.Shutdown] replaced a close code
-	// or reason that cannot be sent. Unlike [ErrInvalidArgument], the call has
-	// taken effect: the close was sent with the replacement, which the error
-	// describes.
+	// ErrCloseArgsReplaced reports that [Conn.Shutdown] or [Reader.Abort]
+	// replaced a close code or reason that cannot be sent. Unlike
+	// [ErrInvalidArgument], the call has taken effect: the close was sent with
+	// the replacement, which the error describes.
 	ErrCloseArgsReplaced = errors.New("websocket: close arguments replaced")
 
 	errReaderScope        = fmt.Errorf("%w: reader used after close", ErrInvalidArgument)
@@ -831,28 +831,52 @@ func (r *Reader) SetReadDeadline(t time.Time) error {
 // Abort stops reading without draining the current message and sends a
 // best-effort close with code and reason.
 //
-// An invalid code or invalid UTF-8 in reason returns [ErrInvalidArgument]
-// without aborting. After a successful Abort, [Conn.Read] returns the callback
-// error or [ErrClosed].
+// The reason is truncated to 123 bytes at a rune boundary.
+// [CloseNoStatusReceived] sends a close frame without a status code or
+// reason. Any other code that cannot be sent is sent as [CloseInternalError],
+// and each run of invalid UTF-8 in reason as U+FFFD; Abort still aborts, and
+// if the close is sent it returns an error matching [ErrCloseArgsReplaced]
+// that describes the substitution. After Abort, [Conn.Read] returns the
+// callback error or [ErrClosed].
 func (r *Reader) Abort(code CloseCode, reason string) error {
 	c := r.c
 	if c == nil {
 		return errReaderScope
 	}
-	if !validWireCloseCode(code) {
-		return errInvalidCloseCode
-	}
-	if !utf8.ValidString(reason) {
-		return errInvalidCloseReason
-	}
+	payload, argErr := closePayload(code, reason)
 	if c.reader.terminalErr != nil {
 		return c.reader.terminalErr
 	}
 	c.reader.err = errReaderAborted
 	c.reader.terminalErr = errReaderAborted
 	c.monitor.endRead()
-	_ = c.writeControlFrame(opClose, buildClosePayload(code, reason), c.frame.controlDeadline())
-	return nil
+	// The close is best-effort; report a substitution only if it was sent.
+	if c.writeControlFrame(opClose, payload, c.frame.controlDeadline()) != nil {
+		return nil
+	}
+	return argErr
+}
+
+// closePayload builds a sendable close payload from code and reason for
+// Shutdown and Abort. [CloseNoStatusReceived] becomes an empty payload, the
+// wire form of "no status". If anything is replaced or dropped, err matches
+// [ErrCloseArgsReplaced] and says what is sent instead.
+func closePayload(code CloseCode, reason string) (_ []byte, err error) {
+	if code == CloseNoStatusReceived {
+		if reason != "" {
+			err = fmt.Errorf("%w; sent a close without status or reason", errCloseReasonDropped)
+		}
+		return nil, err
+	}
+	if !validWireCloseCode(code) {
+		err = fmt.Errorf("%w (%d); sent %d instead", errInvalidCloseCode, code, CloseInternalError)
+		code = CloseInternalError
+	}
+	if !utf8.ValidString(reason) {
+		err = errors.Join(err, fmt.Errorf("%w; sent it with U+FFFD replacements", errInvalidCloseReason))
+		reason = strings.ToValidUTF8(reason, "\uFFFD")
+	}
+	return buildClosePayload(code, reason), err
 }
 
 // Read reads message payload and returns [io.EOF] at the message boundary.
@@ -1316,28 +1340,6 @@ func (c *Conn) handleControlFrame(h frameHeader) error {
 	default:
 		return c.terminateRead(peerError(CloseProtocolError, "unknown control opcode %d", h.opcode))
 	}
-}
-
-// closePayload builds a sendable close payload from code and reason for
-// Shutdown. [CloseNoStatusReceived] becomes an empty payload, the wire form
-// of "no status". If anything is replaced or dropped, err matches
-// [ErrCloseArgsReplaced] and says what is sent instead.
-func closePayload(code CloseCode, reason string) (_ []byte, err error) {
-	if code == CloseNoStatusReceived {
-		if reason != "" {
-			err = fmt.Errorf("%w; sent a close without status or reason", errCloseReasonDropped)
-		}
-		return nil, err
-	}
-	if !validWireCloseCode(code) {
-		err = fmt.Errorf("%w (%d); sent %d instead", errInvalidCloseCode, code, CloseInternalError)
-		code = CloseInternalError
-	}
-	if !utf8.ValidString(reason) {
-		err = errors.Join(err, fmt.Errorf("%w; sent it with U+FFFD replacements", errInvalidCloseReason))
-		reason = strings.ToValidUTF8(reason, "\uFFFD")
-	}
-	return buildClosePayload(code, reason), err
 }
 
 // Shutdown sends a close frame and returns without waiting for the response.

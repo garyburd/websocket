@@ -221,8 +221,8 @@ func readHeader(br *bufio.Reader, isServer bool) (frameHeader, error) {
 // CloseCode is an RFC 6455 close status code.
 //
 // [CloseAbnormalClosure] is receive-only. [CloseNoStatusReceived] is never
-// sent as a code: [Conn.Shutdown] sends it as a close frame with an empty
-// payload.
+// sent as a code: [Conn.Shutdown] and [Reader.Abort] send it as a close frame
+// with an empty payload.
 type CloseCode int
 
 const (
