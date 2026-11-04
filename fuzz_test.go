@@ -780,12 +780,15 @@ func FuzzDialResponse(f *testing.F) {
 // return a UTF-8-validity-preserving prefix within the limit, buildClosePayload
 // must fit the control-frame cap, and a payload built from a valid wire code
 // and reason must round-trip through parseClosePayload while anything else is
-// rejected.
+// rejected. closePayload, which Shutdown and Abort use, must turn any
+// arguments into a close that round-trips, keep valid arguments, and report
+// exactly the replaced ones, never as ErrInvalidArgument.
 func FuzzClosePayload(f *testing.F) {
 	f.Add(uint16(1000), "normal closure")
 	f.Add(uint16(1015), "")                       // receive-only code: invalid on the wire
 	f.Add(uint16(3000), strings.Repeat("é", 100)) // multi-byte rune spanning the truncation cut
 	f.Add(uint16(65535), "\xff\xfe")              // out-of-range code, invalid UTF-8 reason
+	f.Add(uint16(1005), "bye")                    // sent as a close without status; reason dropped
 
 	f.Fuzz(func(t *testing.T, code uint16, reason string) {
 		trunc := truncateUTF8(reason, maxControlPayload-2)
@@ -813,6 +816,32 @@ func FuzzClosePayload(f *testing.F) {
 			t.Fatalf("parseClosePayload: %v", err)
 		case gotCode != CloseCode(code) || gotReason != trunc:
 			t.Fatalf("round trip = (%d, %q), want (%d, %q)", gotCode, gotReason, code, trunc)
+		}
+
+		// The uint16 input cannot express codes beyond the wire format.
+		for _, in := range []CloseCode{CloseCode(code), CloseCode(code) + 1<<16} {
+			wire, err := closePayload(in, reason)
+			if err != nil && (!errors.Is(err, ErrCloseArgsReplaced) || errors.Is(err, ErrInvalidArgument) || !strings.Contains(err.Error(), "sent")) {
+				t.Fatalf("closePayload(%d, %q) err = %v, want only ErrCloseArgsReplaced saying what was sent", in, reason, err)
+			}
+			if in == CloseNoStatusReceived {
+				if len(wire) != 0 || (err != nil) != (reason != "") || (err != nil && !errors.Is(err, errCloseReasonDropped)) {
+					t.Fatalf("closePayload(%d, %q) = (%q, %v), want an empty payload", in, reason, wire, err)
+				}
+				continue
+			}
+			c, r, perr := parseClosePayload(wire)
+			validCode, validReason := validWireCloseCode(in), utf8.ValidString(reason)
+			switch {
+			case perr != nil:
+				t.Fatalf("closePayload(%d, %q) sends %q, which does not parse: %v", in, reason, wire, perr)
+			case validCode && c != in, !validCode && c != CloseInternalError:
+				t.Fatalf("closePayload(%d, %q) code = %d", in, reason, c)
+			case validReason && r != trunc:
+				t.Fatalf("closePayload(%d, %q) reason = %q", in, reason, r)
+			case errors.Is(err, errInvalidCloseCode) == validCode, errors.Is(err, errInvalidCloseReason) == validReason:
+				t.Fatalf("closePayload(%d, %q) err = %v", in, reason, err)
+			}
 		}
 	})
 }
