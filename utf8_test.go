@@ -8,11 +8,10 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
-// utf8Cases are byte slices spanning the well-formed and malformed UTF-8 the
-// RFC 6455 §8.1 check must accept and reject.
+// utf8Cases seed FuzzUTF8Validate with the well-formed and malformed UTF-8
+// the RFC 6455 §8.1 check must accept and reject.
 var utf8Cases = []struct {
 	name  string
 	bytes []byte
@@ -33,27 +32,6 @@ var utf8Cases = []struct {
 	{"BadContinuation", []byte{0xC3, 0x28}},
 	{"FE", []byte{0xFE}},
 	{"FF", []byte{0xFF}},
-}
-
-// TestUTF8ValidateMatchesStdlib checks the DFA against utf8.Valid for complete
-// inputs, and that feeding the bytes in two pieces (split at every offset)
-// reaches the same final state as feeding them all at once, the property the
-// streaming validators rely on.
-func TestUTF8ValidateMatchesStdlib(t *testing.T) {
-	for _, tc := range utf8Cases {
-		t.Run(tc.name, func(t *testing.T) {
-			whole := utf8Validate(utf8Accept, tc.bytes)
-			if got, want := whole == utf8Accept, utf8.Valid(tc.bytes); got != want {
-				t.Errorf("accept = %v, utf8.Valid = %v for %x", got, want, tc.bytes)
-			}
-			for i := 0; i <= len(tc.bytes); i++ {
-				s := utf8Validate(utf8Accept, tc.bytes[:i])
-				if s = utf8Validate(s, tc.bytes[i:]); s != whole {
-					t.Errorf("split at %d gave state %d, whole = %d for %x", i, s, whole, tc.bytes)
-				}
-			}
-		})
-	}
 }
 
 // TestReadInvalidUTF8ClosesWithInvalidData covers rejecting a text message

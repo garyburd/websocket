@@ -118,13 +118,15 @@ func referenceInbound(frames []wireFrame) inboundReference {
 
 // FuzzReadInbound feeds arbitrary bytes to the read path, as a server
 // (masked client frames expected) and as a client (unmasked server frames
-// expected), under several read options. An independent decoder of the
-// input says what a conforming reader does, and the test checks the
-// messages returned, the frames the Conn writes back, and the terminal
-// error against it:
+// expected), under several read options and with a transport that returns
+// its last bytes together with io.EOF. An independent decoder of the input
+// says what a conforming reader does, and the test checks the messages
+// returned, the frames the Conn writes back, and the terminal error against
+// it:
 //
 //   - the messages are a prefix of the input's complete messages, and all
 //     of them when the input simply runs out;
+//   - Reader.Read never returns invalid text unless validation is skipped;
 //   - only well-formed control frames are written: pongs echo the input's
 //     pings in order, and at most one close, last;
 //   - a protocol error sends a close with its code, a peer close is echoed
@@ -136,27 +138,30 @@ func FuzzReadInbound(f *testing.F) {
 	f.Add([]byte{0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i'}) // masked text "hi", zero key
 	f.Add([]byte{0x82, 0x7e, 0x01, 0x00})                       // binary, 256-byte len header, truncated
 	f.Add([]byte{0x01, 0x03, 'a', 'b', 'c', 0x80, 0x02, 'd', 'e'})
-	f.Add([]byte{0x88, 0x04, 0x03, 0xe8, 0xff, 0xfe})                          // close, code 1000, invalid UTF-8 reason
-	f.Add([]byte{0x88, 0x84, 0x01, 0x02, 0x03, 0x04, 0x02, 0xea, 0xfc, 0xfa})  // same close, masked (server mode)
-	f.Add([]byte{0x01, 0x02, 'h', 'i', 0x8a, 0x00, 0x80, 0x01, '!'})           // pong interleaved between text fragments
-	f.Add([]byte{0x89, 0x80, 0x01, 0x02, 0x03, 0x04})                          // masked ping, empty payload
-	f.Add([]byte{0xc1, 0x00})                                                  // RSV1 set
-	f.Add([]byte{0x09, 0x00})                                                  // fragmented (FIN=0) ping
-	f.Add([]byte{0x81, 0x7e, 0x00, 0x7d})                                      // 16-bit length 125: non-minimal encoding
-	f.Add([]byte{0x81, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})  // 64-bit length with MSB set
-	f.Add([]byte{0x89, 0x02, 'p', '1', 0x81, 0x01, 'a', 0x89, 0x02, 'p', '2'}) // pings around a message
-	f.Add([]byte{0x81, 0x02, 0xc3, 0x28})                                      // invalid UTF-8 text
-	f.Add(append([]byte{0x82, 0x7e, 0x00, 0x80}, make([]byte, 128)...))        // 128-byte binary, over the 64-byte limit
+	f.Add([]byte{0x88, 0x04, 0x03, 0xe8, 0xff, 0xfe})                                              // close, code 1000, invalid UTF-8 reason
+	f.Add([]byte{0x88, 0x84, 0x01, 0x02, 0x03, 0x04, 0x02, 0xea, 0xfc, 0xfa})                      // same close, masked (server mode)
+	f.Add([]byte{0x01, 0x02, 'h', 'i', 0x8a, 0x00, 0x80, 0x01, '!'})                               // pong interleaved between text fragments
+	f.Add([]byte{0x89, 0x80, 0x01, 0x02, 0x03, 0x04})                                              // masked ping, empty payload
+	f.Add([]byte{0xc1, 0x00})                                                                      // RSV1 set
+	f.Add([]byte{0x09, 0x00})                                                                      // fragmented (FIN=0) ping
+	f.Add([]byte{0x81, 0x7e, 0x00, 0x7d})                                                          // 16-bit length 125: non-minimal encoding
+	f.Add([]byte{0x81, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})                      // 64-bit length with MSB set
+	f.Add([]byte{0x89, 0x02, 'p', '1', 0x81, 0x01, 'a', 0x89, 0x02, 'p', '2'})                     // pings around a message
+	f.Add([]byte{0x81, 0x02, 0xc3, 0x28})                                                          // invalid UTF-8 text
+	f.Add(append([]byte{0x82, 0x7e, 0x00, 0x80}, make([]byte, 128)...))                            // 128-byte binary, over the 64-byte limit
+	f.Add(append(append([]byte{0x81, 0x7e, 0x03, 0xe8}, bytes.Repeat([]byte("x"), 599)...), 0xff)) // invalid text cut short
 
 	variants := []struct {
 		name       string
 		opts       *ReadOptions
 		maxMsg     int
 		mayTimeout bool // MinReadRate's watchdog may fire if the fuzzer stalls
+		dataErr    bool // the transport returns its last bytes with io.EOF
 	}{
-		{"default", nil, 1 << 20, false},
-		{"skipUTF8", &ReadOptions{SkipUTF8Validation: true, MatchPong: true, MinReadRate: 1}, 1 << 20, true},
-		{"limit64", nil, 64, false},
+		{"default", nil, 1 << 20, false, false},
+		{"dataErr", nil, 1 << 20, false, true},
+		{"skipUTF8", &ReadOptions{SkipUTF8Validation: true, MatchPong: true, MinReadRate: 1}, 1 << 20, true, false},
+		{"limit64", nil, 64, false, false},
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		for _, isServer := range []bool{false, true} {
@@ -164,6 +169,9 @@ func FuzzReadInbound(f *testing.F) {
 			ref := referenceInbound(in)
 			for _, v := range variants {
 				rwc := &inboundRWC{r: bytes.NewReader(data)}
+				if v.dataErr {
+					rwc.r = iotest.DataErrReader(rwc.r)
+				}
 				c := newConn(rwc, nil, connConfig{
 					isServer:            isServer,
 					controlReplyTimeout: time.Hour,
@@ -171,15 +179,9 @@ func FuzzReadInbound(f *testing.F) {
 					maxMessageSize:      v.maxMsg,
 					writeBufferSize:     4096,
 				})
-				var got []inboundMessage
-				var err error
-				for {
-					var msg []byte
-					var mt MessageType
-					if msg, mt, err = c.ReadMessage(v.opts); err != nil {
-						break
-					}
-					got = append(got, inboundMessage{mt, msg})
+				got, err := readInbound(c, v.opts)
+				if err != nil && errors.Is(err, errInvalidTextReturned) {
+					t.Fatalf("isServer=%v %s: %v", isServer, v.name, err)
 				}
 				if _, _, err2 := c.ReadMessage(v.opts); err2 == nil {
 					t.Fatalf("isServer=%v %s: ReadMessage succeeded after a terminal read error", isServer, v.name)
@@ -191,6 +193,43 @@ func FuzzReadInbound(f *testing.F) {
 			}
 		}
 	})
+}
+
+var errInvalidTextReturned = errors.New("Reader.Read returned invalid UTF-8 text")
+
+// readInbound reads messages until an error. Unless validation is skipped, it
+// fails with errInvalidTextReturned if Reader.Read returns invalid text, even
+// alongside an error.
+func readInbound(c *Conn, opts *ReadOptions) ([]inboundMessage, error) {
+	validate := opts == nil || !opts.SkipUTF8Validation
+	buf := make([]byte, 512)
+	var got []inboundMessage
+	for {
+		var m inboundMessage
+		err := c.Read(opts, func(r *Reader) error {
+			m.mt = r.Type()
+			state := uint32(utf8Accept)
+			for {
+				n, err := r.Read(buf)
+				m.payload = append(m.payload, buf[:n]...)
+				if validate && m.mt == MessageText {
+					if state = utf8Validate(state, buf[:n]); state == utf8Reject {
+						return errInvalidTextReturned
+					}
+				}
+				if err == io.EOF {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+			}
+		})
+		if err != nil {
+			return got, err
+		}
+		got = append(got, m)
+	}
 }
 
 // checkInbound checks one FuzzReadInbound run against the reference.
@@ -493,6 +532,7 @@ func FuzzRoundTrip(f *testing.F) {
 			mt, opcode = MessageBinary, opBinary
 		}
 
+		orig := bytes.Clone(payload)
 		var wire bytes.Buffer
 		writer := newConn(&captureRWC{w: &wire}, nil, connConfig{
 			isServer:            fromServer,
@@ -507,6 +547,9 @@ func FuzzRoundTrip(f *testing.F) {
 		writer.Close()
 		if err != nil {
 			t.Fatalf("Write: %v", err)
+		}
+		if !bytes.Equal(payload, orig) {
+			t.Fatal("Write modified the caller's payload")
 		}
 
 		frames, err := parseWire(wire.Bytes(), !fromServer)
@@ -846,6 +889,15 @@ func FuzzClosePayload(f *testing.F) {
 	})
 }
 
+// refMask is the naive per-byte reference for maskCopy.
+func refMask(b []byte, key [4]byte, pos int) int {
+	pos &= 3
+	for i := range b {
+		b[i] ^= key[(pos+i)&3]
+	}
+	return (pos + len(b)) & 3
+}
+
 // FuzzMaskCopy checks maskCopy (out-of-place and in-place) against the
 // naive per-byte reference (refMask) for arbitrary payloads, keys, and
 // starting positions.
@@ -892,14 +944,9 @@ func FuzzMaskCopy(f *testing.F) {
 // them whole, the carry-across-chunks property the streaming read path relies
 // on. The split loop is O(n^2), so it is capped; the oracle check always runs.
 func FuzzUTF8Validate(f *testing.F) {
-	f.Add([]byte("hello"))
-	f.Add([]byte("héllo, €uro 😀"))
-	f.Add([]byte{0xff})
-	f.Add([]byte{0xc3, 0x28})             // bad continuation
-	f.Add([]byte{0xe0, 0x80, 0xaf})       // overlong
-	f.Add([]byte{0xed, 0xa0, 0x80})       // surrogate
-	f.Add([]byte{0xf4, 0x90, 0x80, 0x80}) // > U+10FFFF
-	f.Add([]byte{0xc3})                   // truncated lead byte
+	for _, tc := range utf8Cases {
+		f.Add(tc.bytes)
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		whole := utf8Validate(utf8Accept, data)

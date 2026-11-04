@@ -63,33 +63,6 @@ func TestWriteOptionsValidate(t *testing.T) {
 	}
 }
 
-func TestWriteCtxCancelBeforeAcquire(t *testing.T) {
-	c, peer := connPair(t)
-
-	// Occupy the writer lock so the next Write must wait to acquire it.
-	c.writer.mu <- struct{}{}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err := c.WriteMessage(ctx, MessageText, nil, []byte("x"))
-	if !errors.Is(err, errWriteUnstarted) {
-		t.Errorf("cancelled ctx: err = %v, want errWriteUnstarted", err)
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("err = %v, want it to wrap context.Canceled", err)
-	}
-
-	// The acquire wait is non-destructive: releasing the lock leaves the
-	// connection fully usable.
-	<-c.writer.mu
-	done := make(chan struct{})
-	go func() { defer close(done); _ = readPeerFrame(t, peer) }()
-	if err := c.WriteMessage(context.Background(), MessageText, nil, []byte("ok")); err != nil {
-		t.Errorf("WriteMessage after cancelled acquire = %v, want nil", err)
-	}
-	<-done
-}
-
 func TestConcurrentReadRejected(t *testing.T) {
 	c, peer := connPair(t)
 

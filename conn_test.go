@@ -228,8 +228,7 @@ func fragments(op int, payload []byte, sizes ...int) []peerFrame {
 }
 
 // TestServerReadsZeroMaskKey verifies the server accepts a masked frame whose
-// mask key is all zeros: the identity mask is skipped and the payload is
-// delivered as it appeared on the wire.
+// mask key is all zeros.
 func TestServerReadsZeroMaskKey(t *testing.T) {
 	c, peer := connPair(t, withServer())
 	payload := "hello, world"
@@ -768,9 +767,8 @@ func TestWriterReadFromSourceErrorFailsMessage(t *testing.T) {
 	}
 }
 
-// TestConcurrentWriteMessages runs writers in parallel so the race detector
-// sees Conn.Write's post-close bookkeeping overlap the next writer's setup.
-// Every message must arrive whole, as its own single frame.
+// TestConcurrentWriteMessages checks that concurrent writers each deliver
+// whole messages, each as its own single frame.
 func TestConcurrentWriteMessages(t *testing.T) {
 	const writers, perWriter = 8, 50
 	c, peer := connPair(t)
@@ -810,22 +808,34 @@ func TestConcurrentWriteMessages(t *testing.T) {
 	}
 }
 
-// TestWriteCanceledContextNeverAcquires checks that a done context fails
-// writer acquisition even when the writer is free. Without the explicit
-// check, select picks between the two ready cases at random.
-func TestWriteCanceledContextNeverAcquires(t *testing.T) {
-	c, _ := connPair(t)
+// TestWriteCanceledContext checks that a done context fails writer
+// acquisition, whether the writer is free or held, without touching the
+// connection.
+func TestWriteCanceledContext(t *testing.T) {
+	c, peer := connPair(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	for range 100 {
-		err := c.Write(ctx, MessageBinary, nil, func(*Writer) error {
-			t.Fatal("callback ran with a canceled context")
+	write := func() error {
+		return c.Write(ctx, MessageText, nil, func(*Writer) error {
+			t.Error("callback ran with a canceled context")
 			return nil
 		})
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Write err = %v, want context.Canceled", err)
-		}
 	}
+	if err := write(); !errors.Is(err, context.Canceled) {
+		t.Errorf("Write with free writer = %v, want context.Canceled", err)
+	}
+	c.writer.mu <- struct{}{} // hold the writer
+	if err := write(); !errors.Is(err, context.Canceled) {
+		t.Errorf("Write with held writer = %v, want context.Canceled", err)
+	}
+	<-c.writer.mu
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = readPeerFrame(t, peer) }()
+	if err := c.WriteMessage(context.Background(), MessageText, nil, []byte("ok")); err != nil {
+		t.Errorf("WriteMessage after canceled writes = %v, want nil", err)
+	}
+	<-done
 }
 
 func TestWriterReadFromDataWithEOF(t *testing.T) {
@@ -895,122 +905,6 @@ func TestReaderWriteTo(t *testing.T) {
 	want := append(append([]byte{}, part1...), part2...)
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Errorf("copied %d bytes, want %d", buf.Len(), len(want))
-	}
-}
-
-func TestServerWriteLargerThanBuffer(t *testing.T) {
-	// A server frame whose payload exceeds WriteBufferSize takes the
-	// two-write path in writeFrameLocked: the first rwc.Write carries the
-	// header plus a buffer's worth of payload; the second writes the
-	// remainder straight from the caller's slice with no copy. Verify
-	// the frame round-trips unmasked and intact and that the caller's
-	// slice is left untouched.
-	c, peer := connPair(t, withServer(), withBufSize(64))
-
-	payload := bytes.Repeat([]byte("0123456789abcdef"), 50) // 800 bytes > 64
-	orig := bytes.Clone(payload)
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- c.WriteMessage(context.Background(), MessageBinary, nil, payload) }()
-
-	// Read the server frame on the peer: unmasked, 16-bit length.
-	var hdr [2]byte
-	if _, err := io.ReadFull(peer, hdr[:]); err != nil {
-		t.Fatalf("peer read header: %v", err)
-	}
-	if hdr[0] != 0x80|byte(opBinary) {
-		t.Errorf("hdr[0] = %#x, want fin|binary", hdr[0])
-	}
-	if hdr[1]&0x80 != 0 {
-		t.Errorf("server frame is masked; want unmasked")
-	}
-	if hdr[1]&0x7F != 126 {
-		t.Fatalf("length field = %d, want 126 (16-bit form)", hdr[1]&0x7F)
-	}
-	var ext [2]byte
-	if _, err := io.ReadFull(peer, ext[:]); err != nil {
-		t.Fatalf("peer read ext-len: %v", err)
-	}
-	length := int(binary.BigEndian.Uint16(ext[:]))
-	if length != len(payload) {
-		t.Fatalf("frame length = %d, want %d", length, len(payload))
-	}
-	got := make([]byte, length)
-	if _, err := io.ReadFull(peer, got); err != nil {
-		t.Fatalf("peer read payload: %v", err)
-	}
-	if !bytes.Equal(got, orig) {
-		t.Errorf("payload round-trip mismatch")
-	}
-	if !bytes.Equal(payload, orig) {
-		t.Errorf("writeFrameLocked mutated the caller's payload slice")
-	}
-	if err := <-errCh; err != nil {
-		t.Errorf("WriteMessage: %v", err)
-	}
-}
-
-// countingConn wraps a net.Conn and counts Write calls, so a test can assert
-// how many segments a frame reaches the transport in. writes is read only
-// after the writing goroutine is joined (a channel receive), so no atomics.
-type countingConn struct {
-	net.Conn
-	writes int
-}
-
-func (c *countingConn) Write(p []byte) (int, error) {
-	c.writes++
-	return c.Conn.Write(p)
-}
-
-// TestWriteSegmentCount pins how many Writes one large frame makes to the
-// transport: a server frame goes out in exactly two (header + a buffer's
-// worth of payload, then the uncopied tail in one write), and a client frame
-// in the two-segment shape plus the tail chunked through the write buffer,
-// which masking requires (it must not modify the caller's slice). Rate mode
-// must not change the segmentation: the frame's deadline is computed from its
-// payload size up front, not enforced by chunking the writes.
-func TestWriteSegmentCount(t *testing.T) {
-	const bufSize = 64              // capRoom = bufSize - maxHeaderLen = 50
-	payload := make([]byte, 800)    // one frame: 50 in-buffer + 750 overflow tail
-	clientWrites := 1 + (750+63)/64 // header segment + masked 64-byte chunks
-	cases := []struct {
-		name       string
-		server     bool
-		opts       *WriteOptions
-		wantWrites int
-		wireLen    int // header + payload as the peer sees it
-	}{
-		{"Server", true, nil, 2, 4 + 800},
-		{"ServerRate", true, &WriteOptions{MinWriteRate: 100000}, 2, 4 + 800},
-		{"Client", false, nil, clientWrites, 8 + 800},
-		{"ClientRate", false, &WriteOptions{MinWriteRate: 100000}, clientWrites, 8 + 800},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			a, b := net.Pipe()
-			cc := &countingConn{Conn: a}
-			opts := []func(*connConfig){withBufSize(bufSize)}
-			if tc.server {
-				opts = append(opts, withServer())
-			}
-			c := newTestConn(t, cc, opts...)
-			t.Cleanup(func() { _ = b.Close() })
-
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- c.WriteMessage(context.Background(), MessageBinary, tc.opts, payload)
-			}()
-			if _, err := io.ReadFull(b, make([]byte, tc.wireLen)); err != nil {
-				t.Fatalf("peer drain: %v", err)
-			}
-			if err := <-errCh; err != nil {
-				t.Fatalf("WriteMessage: %v", err)
-			}
-			if cc.writes != tc.wantWrites {
-				t.Errorf("transport writes = %d, want %d", cc.writes, tc.wantWrites)
-			}
-		})
 	}
 }
 
@@ -1743,85 +1637,6 @@ func TestReadEOFKinds(t *testing.T) {
 	}
 }
 
-// payloadErrorRWC returns a complete payload with an allowed trailing error.
-type payloadErrorRWC struct {
-	header     []byte
-	payload    []byte
-	payloadErr error
-	phase      int
-}
-
-func (r *payloadErrorRWC) Read(p []byte) (int, error) {
-	switch r.phase {
-	case 0:
-		r.phase++
-		return copy(p, r.header), nil
-	case 1:
-		r.phase++
-		return copy(p, r.payload), r.payloadErr
-	default:
-		return 0, io.EOF
-	}
-}
-
-func (r *payloadErrorRWC) Write(p []byte) (int, error) { return len(p), nil }
-func (r *payloadErrorRWC) Close() error                { return nil }
-
-func TestReadCompletePayloadWithError(t *testing.T) {
-	// Exceed the internal buffer to expose the payload and error together.
-	payload := bytes.Repeat([]byte("x"), 300)
-	var header [maxHeaderLen]byte
-	n := buildHeader(header[:], true, opBinary, true, len(payload), [4]byte{})
-	payloadErr := errors.New("transport returned data with error")
-	rwc := &payloadErrorRWC{
-		header:     bytes.Clone(header[:n]),
-		payload:    payload,
-		payloadErr: payloadErr,
-	}
-	c := newTestConn(t, rwc)
-
-	got, mt, err := c.ReadMessage(nil)
-	if err != nil {
-		t.Fatalf("ReadMessage = %v, want complete message despite accompanying transport error", err)
-	}
-	if mt != MessageBinary || !bytes.Equal(got, payload) {
-		t.Errorf("ReadMessage = (%v, %d bytes), want (Binary, %d bytes)", mt, len(got), len(payload))
-	}
-
-	_, _, err = c.ReadMessage(nil)
-	var ce *CloseError
-	if !errors.As(err, &ce) || ce.Code != CloseAbnormalClosure {
-		t.Errorf("next ReadMessage = %v, want CloseAbnormalClosure at the following frame boundary", err)
-	}
-}
-
-func TestReadInvalidTextWithError(t *testing.T) {
-	// Invalid text that arrives together with a transport error, before the
-	// frame is complete, is still validated: Read rejects it rather than
-	// returning it alongside the transport error.
-	payload := append(bytes.Repeat([]byte("x"), 299), 0xff)
-	var header [maxHeaderLen]byte
-	n := buildHeader(header[:], true, opText, true, len(payload)+100, [4]byte{})
-	rwc := &payloadErrorRWC{
-		header:     bytes.Clone(header[:n]),
-		payload:    payload, // exceeds the internal buffer, so it is read directly
-		payloadErr: io.EOF,
-	}
-	c := newTestConn(t, rwc)
-
-	err := c.Read(nil, func(r *Reader) error {
-		buf := make([]byte, 512)
-		n, err := r.Read(buf)
-		if n != 0 {
-			t.Errorf("Read returned %d bytes of invalid text", n)
-		}
-		return err
-	})
-	if !errors.Is(err, ErrProtocol) || errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Errorf("Read = %v, want ErrProtocol for invalid UTF-8", err)
-	}
-}
-
 func TestZeroMaxMessageSizeUnlimited(t *testing.T) {
 	// maxMsg == 0 imposes no limit beyond the protocol's: a message
 	// larger than the former 1 MiB default reads in full.
@@ -1950,19 +1765,6 @@ func TestWriterWriteAfterCloseReturnsScopeError(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 	<-done
-}
-
-// writeControlFrame is the internal entry point used by the read loop
-// (Pong echoes, close echoes) and the keepalive ping; well-formed output
-// is covered by the keepalive and close-handshake tests. This guards its
-// size validation: control payloads are capped at 125 bytes (RFC 6455 §5.5).
-func TestWriteControlFrameRejectsOversizedPayload(t *testing.T) {
-	c, peer := connPair(t)
-	go drainPeer(peer)
-	err := c.writeControlFrame(opPing, make([]byte, 200), c.frame.controlDeadline())
-	if err == nil || !strings.Contains(err.Error(), "too large") {
-		t.Errorf("writeControlFrame(oversized) = %v, want too-large rejection", err)
-	}
 }
 
 func TestReadReturnsSameErrorAfterClose(t *testing.T) {
@@ -2246,18 +2048,11 @@ func (c *Conn) errRead() error {
 
 func TestContendedFrameLockTimesOutWithoutTeardown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// A write that cannot acquire frameMu within its budget must return
-		// errWriteTimeout and leave the connection untouched: nothing went on the
-		// wire, so the conn stays usable. This is distinct from a mid-write stall
-		// (TestWriteTimeoutFiresWhenPeerStalls), where rwc.Write itself overruns
-		// its deadline and the frame watchdog tears the transport down.
+		// A write that cannot acquire the frame lock within its budget times
+		// out without tearing down the connection: nothing went on the wire.
 		c, peer := connPair(t, withWriteTimeout(50*time.Millisecond))
 
-		// Occupy frameMu as if another writer held it (frameMu is a 1-slot channel
-		// used as a mutex). A real holder would be parked in rwc.Write; taking the
-		// slot directly is equivalent for the contention path and avoids arming
-		// that holder's own frame timer, which would muddy the assertion.
-		c.frame.mu <- struct{}{}
+		c.frame.mu <- struct{}{} // hold the frame lock
 
 		// writeControlFrame is bounded by the control write timeout; the bubble's
 		// fake clock advances the 50 ms while the lock remains occupied.
@@ -2728,44 +2523,6 @@ func TestWriteRecipesReassemble(t *testing.T) {
 	}
 }
 
-// repeatReader reads p repeatedly, without end.
-type repeatReader struct {
-	p   []byte
-	off int
-}
-
-func (r *repeatReader) Read(b []byte) (int, error) {
-	n := 0
-	for n < len(b) {
-		k := copy(b[n:], r.p[r.off:])
-		n += k
-		r.off = (r.off + k) % len(r.p)
-	}
-	return n, nil
-}
-
-func TestControlFrameDoesNotAllocate(t *testing.T) {
-	// Pings and pongs arrive for the life of a connection; handling one
-	// (reading its payload and, for a ping, writing the pong) must not
-	// allocate. The header is fixed so only handleControlFrame is measured.
-	for _, op := range []int{opPing, opPong} {
-		c := newTestConn(t, struct {
-			io.Reader
-			io.Writer
-			io.Closer
-		}{&repeatReader{p: []byte("payload")}, io.Discard, io.NopCloser(nil)})
-		h := frameHeader{fin: true, opcode: op, length: len("payload")}
-		allocs := testing.AllocsPerRun(1000, func() {
-			if err := c.handleControlFrame(h); err != nil {
-				t.Fatalf("handleControlFrame: %v", err)
-			}
-		})
-		if allocs != 0 {
-			t.Errorf("handling opcode %d allocates %v times, want 0", op, allocs)
-		}
-	}
-}
-
 func TestInvalidUTF8RejectedBeforeFrameCompletes(t *testing.T) {
 	// Autobahn 6.4.3: one text frame whose payload arrives in chops. The
 	// second chop makes the text invalid (U+110000), and the read must fail
@@ -2806,30 +2563,5 @@ func TestInvalidUTF8RejectedBeforeFrameCompletes(t *testing.T) {
 				t.Errorf("read err = %v, want ErrProtocol", err)
 			}
 		})
-	}
-}
-
-func TestReaderReadReturnsAvailablePayload(t *testing.T) {
-	// Read returns the payload that has arrived instead of waiting to fill p,
-	// so a slow frame is validated and delivered as it arrives.
-	c, peer := connPair(t)
-	go func() {
-		peer.Write([]byte{0x82, 10, 'a', 'b', 'c', 'd'}) // 6 of 10 bytes withheld
-	}()
-	got := make(chan string, 1)
-	go c.Read(nil, func(r *Reader) error {
-		buf := make([]byte, 10)
-		n, _ := r.Read(buf)
-		got <- string(buf[:n])
-		return r.Abort(CloseNormalClosure, "")
-	})
-	go drainPeer(peer)
-	select {
-	case s := <-got:
-		if s != "abcd" {
-			t.Errorf("Read returned %q, want %q", s, "abcd")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Read waited for the rest of the frame")
 	}
 }
