@@ -568,6 +568,11 @@ type reader struct {
 	validateUTF8 bool
 	utf8State    uint32
 
+	// control holds the payload of the control frame being handled. Nothing
+	// retains it after handleControlFrame returns: replies copy it into the
+	// frame buffer, and a close reason is copied into a string.
+	control [maxControlPayload]byte
+
 	// Sticky across messages; guarded by mu.
 	terminalErr error
 }
@@ -1265,7 +1270,7 @@ func (c *Conn) handleControlFrame(h frameHeader) error {
 	if !h.fin {
 		return c.terminateRead(peerError(CloseProtocolError, "fragmented control frame"))
 	}
-	payload := make([]byte, h.length)
+	payload := c.reader.control[:h.length]
 	if _, err := readFull(c.br, payload); err != nil {
 		return c.terminateRead(err)
 	}

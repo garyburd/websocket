@@ -2607,3 +2607,41 @@ func TestWriteRecipesReassemble(t *testing.T) {
 		})
 	}
 }
+
+// repeatReader reads p repeatedly, without end.
+type repeatReader struct {
+	p   []byte
+	off int
+}
+
+func (r *repeatReader) Read(b []byte) (int, error) {
+	n := 0
+	for n < len(b) {
+		k := copy(b[n:], r.p[r.off:])
+		n += k
+		r.off = (r.off + k) % len(r.p)
+	}
+	return n, nil
+}
+
+func TestControlFrameDoesNotAllocate(t *testing.T) {
+	// Pings and pongs arrive for the life of a connection; handling one
+	// (reading its payload and, for a ping, writing the pong) must not
+	// allocate. The header is fixed so only handleControlFrame is measured.
+	for _, op := range []int{opPing, opPong} {
+		c := newTestConn(t, struct {
+			io.Reader
+			io.Writer
+			io.Closer
+		}{&repeatReader{p: []byte("payload")}, io.Discard, io.NopCloser(nil)})
+		h := frameHeader{fin: true, opcode: op, length: len("payload")}
+		allocs := testing.AllocsPerRun(1000, func() {
+			if err := c.handleControlFrame(h); err != nil {
+				t.Fatalf("handleControlFrame: %v", err)
+			}
+		})
+		if allocs != 0 {
+			t.Errorf("handling opcode %d allocates %v times, want 0", op, allocs)
+		}
+	}
+}
