@@ -184,6 +184,11 @@ func TestTokenListHas(t *testing.T) {
 		{[]string{"WebSocket"}, "websocket", true},
 		{[]string{"upgrade, websocket"}, "websocket", true},
 		{[]string{"a, b ", " c, d"}, "c", true},
+		{[]string{"\tupgrade\t"}, "upgrade", true},
+		// Only space and tab are optional whitespace.
+		{[]string{"\rupgrade"}, "upgrade", false},
+		{[]string{"upgrade\v"}, "upgrade", false},
+		{[]string{"upgrade\u00a0"}, "upgrade", false},
 		{[]string{"a", "b"}, "c", false},
 		{nil, "anything", false},
 	}

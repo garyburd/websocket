@@ -88,6 +88,9 @@ func TestSupportedSubprotocols(t *testing.T) {
 		{"NoOverlap", "chat.v3", []string{"chat.v1", "chat.v2"}, ""},
 		// Subprotocol identifiers are case-sensitive tokens.
 		{"CaseSensitive", "Chat.V1", []string{"chat.v1"}, ""},
+		{"TabsTrimmed", "\tchat.v1\t", []string{"chat.v1"}, "chat.v1"},
+		// Only space and tab are optional whitespace.
+		{"NBSPNotTrimmed", "chat.v1\u00a0", []string{"chat.v1"}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

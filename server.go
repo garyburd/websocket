@@ -117,7 +117,7 @@ func SupportedSubprotocols(supported ...string) func(*http.Request) string {
 	return func(r *http.Request) string {
 		for _, hdr := range r.Header.Values("Sec-Websocket-Protocol") {
 			for c := range strings.SplitSeq(hdr, ",") {
-				if c = strings.TrimSpace(c); slices.Contains(supported, c) {
+				if c = trimOWS(c); slices.Contains(supported, c) {
 					return c
 				}
 			}

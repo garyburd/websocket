@@ -35,11 +35,16 @@ func generateChallengeKey() string {
 	return base64.StdEncoding.EncodeToString(p[:])
 }
 
+// trimOWS removes optional whitespace (RFC 7230 §3.2.3): spaces and tabs
+// only, as net/http does. strings.TrimSpace would also accept other control
+// and Unicode space characters around a token.
+func trimOWS(s string) string { return strings.Trim(s, " \t") }
+
 // tokenListHas searches comma-separated header values case-insensitively.
 func tokenListHas(values []string, token string) bool {
 	for _, v := range values {
 		for part := range strings.SplitSeq(v, ",") {
-			if strings.EqualFold(strings.TrimSpace(part), token) {
+			if strings.EqualFold(trimOWS(part), token) {
 				return true
 			}
 		}
