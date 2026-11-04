@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1593,8 +1594,11 @@ func TestReadEOFKinds(t *testing.T) {
 	// EOF placement decides the read error: at a frame boundary it is a
 	// CloseError with CloseAbnormalClosure (the peer vanished without a
 	// close frame); inside a frame (header or payload cut short) it is
-	// io.ErrUnexpectedEOF.
+	// io.ErrUnexpectedEOF. Within a fragmented message, either way the
+	// partial message is never reported as complete, by ReadMessage or by
+	// the streaming Reader.
 	textFrame := []byte{0x81, 0x05, 'h', 'e', 'l', 'l', 'o'} // unmasked Text "hello", fin
+	firstFragment := []byte{0x01, 0x03, 'h', 'e', 'l'}       // unmasked Text "hel", no fin
 	cases := []struct {
 		name  string
 		wire  []byte
@@ -1604,25 +1608,45 @@ func TestReadEOFKinds(t *testing.T) {
 		{"boundary after message", textFrame, true, &CloseError{Code: CloseAbnormalClosure}},
 		{"truncated header", []byte{0x81}, false, io.ErrUnexpectedEOF},
 		{"truncated payload", []byte{0x81, 0x05, 'h', 'e'}, false, io.ErrUnexpectedEOF},
+		{"between fragments", firstFragment, false, &CloseError{Code: CloseAbnormalClosure}},
+		{"truncated continuation header", append(slices.Clip(firstFragment), 0x80), false, io.ErrUnexpectedEOF},
+		{"truncated continuation payload", append(slices.Clip(firstFragment), 0x80, 0x02, 'l'), false, io.ErrUnexpectedEOF},
+	}
+	reads := []struct {
+		name string
+		read func(c *Conn) error
+	}{
+		{"ReadMessage", func(c *Conn) error {
+			_, _, err := c.ReadMessage(nil)
+			return err
+		}},
+		{"Read", func(c *Conn) error {
+			return c.Read(nil, func(r *Reader) error {
+				_, err := io.ReadAll(r)
+				return err
+			})
+		}},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := newTestConn(t, &sinkRWC{r: bytes.NewReader(tc.wire)})
-			if tc.first {
-				if _, _, err := c.ReadMessage(nil); err != nil {
-					t.Fatalf("ReadMessage before EOF: %v", err)
+		for _, rd := range reads {
+			t.Run(tc.name+"/"+rd.name, func(t *testing.T) {
+				c := newTestConn(t, &sinkRWC{r: bytes.NewReader(tc.wire)})
+				if tc.first {
+					if err := rd.read(c); err != nil {
+						t.Fatalf("read before EOF: %v", err)
+					}
 				}
-			}
-			_, _, err := c.ReadMessage(nil)
-			if wantCE, ok := errors.AsType[*CloseError](tc.want); ok {
-				var ce *CloseError
-				if !errors.As(err, &ce) || ce.Code != wantCE.Code {
-					t.Fatalf("ReadMessage err = %v, want *CloseError with code %d", err, wantCE.Code)
+				err := rd.read(c)
+				if wantCE, ok := errors.AsType[*CloseError](tc.want); ok {
+					var ce *CloseError
+					if !errors.As(err, &ce) || ce.Code != wantCE.Code {
+						t.Fatalf("read err = %v, want *CloseError with code %d", err, wantCE.Code)
+					}
+				} else if !errors.Is(err, tc.want) {
+					t.Fatalf("read err = %v, want %v", err, tc.want)
 				}
-			} else if !errors.Is(err, tc.want) {
-				t.Fatalf("ReadMessage err = %v, want %v", err, tc.want)
-			}
-		})
+			})
+		}
 	}
 }
 
