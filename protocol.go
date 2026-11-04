@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
@@ -142,17 +143,30 @@ func readFull(r io.Reader, p []byte) (int, error) {
 	return n, err
 }
 
-// readHeader parses and validates one frame header.
-func readHeader(r io.Reader, isServer bool) (frameHeader, error) {
-	var hdr [2]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+// peekFrame returns the next n bytes of a frame header from br's buffer. An
+// EOF before any byte is a clean end of stream and stays io.EOF; once the
+// frame has begun, an EOF is premature and becomes io.ErrUnexpectedEOF.
+func peekFrame(br *bufio.Reader, n int) ([]byte, error) {
+	p, err := br.Peek(n)
+	if err == io.EOF && len(p) > 0 {
+		err = io.ErrUnexpectedEOF
+	}
+	return p, err
+}
+
+// readHeader parses and validates one frame header. It peeks at the header
+// in br's buffer rather than copying it out, so it does not allocate. Each
+// field is validated as soon as it arrives, without waiting for the rest.
+func readHeader(br *bufio.Reader, isServer bool) (frameHeader, error) {
+	p, err := peekFrame(br, 2)
+	if err != nil {
 		return frameHeader{}, err
 	}
-	fin := hdr[0]&0x80 != 0
-	rsv := hdr[0] & 0x70
-	op := int(hdr[0] & 0x0F)
-	masked := hdr[1]&0x80 != 0
-	length := uint64(hdr[1] & 0x7F)
+	fin := p[0]&0x80 != 0
+	rsv := p[0] & 0x70
+	op := int(p[0] & 0x0F)
+	masked := p[1]&0x80 != 0
+	length := uint64(p[1] & 0x7F)
 
 	if rsv != 0 {
 		return frameHeader{}, peerError(CloseProtocolError, "RSV bits set")
@@ -164,22 +178,23 @@ func readHeader(r io.Reader, isServer bool) (frameHeader, error) {
 		return frameHeader{}, peerError(CloseProtocolError, "server sent masked frame")
 	}
 
+	n := 2
 	switch length {
 	case 126:
-		var ext [2]byte
-		if _, err := readFull(r, ext[:]); err != nil {
+		n += 2
+		if p, err = peekFrame(br, n); err != nil {
 			return frameHeader{}, err
 		}
-		length = uint64(binary.BigEndian.Uint16(ext[:]))
+		length = uint64(binary.BigEndian.Uint16(p[2:4]))
 		if length < 126 {
 			return frameHeader{}, peerError(CloseProtocolError, "non-minimal length encoding")
 		}
 	case 127:
-		var ext [8]byte
-		if _, err := readFull(r, ext[:]); err != nil {
+		n += 8
+		if p, err = peekFrame(br, n); err != nil {
 			return frameHeader{}, err
 		}
-		length = binary.BigEndian.Uint64(ext[:])
+		length = binary.BigEndian.Uint64(p[2:10])
 		if length <= 0xFFFF {
 			return frameHeader{}, peerError(CloseProtocolError, "non-minimal length encoding")
 		}
@@ -187,17 +202,19 @@ func readHeader(r io.Reader, isServer bool) (frameHeader, error) {
 			return frameHeader{}, peerError(CloseProtocolError, "64-bit length has MSB set")
 		}
 	}
-
-	h := frameHeader{fin: fin, opcode: op}
-	if isServer {
-		if _, err := readFull(r, h.maskKey[:]); err != nil {
-			return frameHeader{}, err
-		}
-	}
 	if length > math.MaxInt {
 		return frameHeader{}, peerError(CloseProtocolError, "frame too large (%d)", length)
 	}
-	h.length = int(length)
+
+	h := frameHeader{fin: fin, opcode: op, length: int(length)}
+	if isServer {
+		n += 4
+		if p, err = peekFrame(br, n); err != nil {
+			return frameHeader{}, err
+		}
+		copy(h.maskKey[:], p[n-4:n])
+	}
+	br.Discard(n)
 	return h, nil
 }
 

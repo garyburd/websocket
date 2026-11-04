@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -45,7 +46,7 @@ func TestBuildHeaderBytes(t *testing.T) {
 // TestRoundTrip builds a header and parses it back. The peer reads the frame,
 // so the receiver's role is the opposite of the sender's: a client-built
 // (masked) header is parsed with isServer=true and vice versa. OneByteReader
-// exercises the io.ReadFull loops one byte at a time.
+// makes bufio fill the peeked header one byte at a time.
 func TestRoundTrip(t *testing.T) {
 	key := [4]byte{0x01, 0x02, 0x03, 0x04}
 	for _, payloadLen := range []int{0, 1, 125, 126, 0xFFFF, 0x10000, 1 << 30} {
@@ -54,7 +55,7 @@ func TestRoundTrip(t *testing.T) {
 			n := buildHeader(buf[:], senderIsServer, opBinary, true, payloadLen, key)
 
 			receiverIsServer := !senderIsServer
-			h, err := readHeader(iotest.OneByteReader(bytes.NewReader(buf[:n])), receiverIsServer)
+			h, err := readHeader(bufio.NewReader(iotest.OneByteReader(bytes.NewReader(buf[:n]))), receiverIsServer)
 			if err != nil {
 				t.Fatalf("payloadLen=%d senderIsServer=%v: readHeader: %v", payloadLen, senderIsServer, err)
 			}
@@ -86,10 +87,13 @@ func TestReadHeaderProtocolError(t *testing.T) {
 		{"non-minimal 16-bit", false, []byte{0x82, 126, 0x00, 0x05}, "non-minimal length encoding"},
 		{"non-minimal 64-bit", false, []byte{0x82, 127, 0, 0, 0, 0, 0, 0, 0x00, 0x05}, "non-minimal length encoding"},
 		{"64-bit MSB set", false, []byte{0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0}, "64-bit length has MSB set"},
+		// The length is rejected before the mask key that would follow it.
+		{"non-minimal 16-bit before mask key", true, []byte{0x82, 0x80 | 126, 0x00, 0x05}, "non-minimal length encoding"},
+		{"non-minimal 64-bit before mask key", true, []byte{0x82, 0x80 | 127, 0, 0, 0, 0, 0, 0, 0x00, 0x05}, "non-minimal length encoding"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := readHeader(iotest.OneByteReader(bytes.NewReader(tc.bytes)), tc.isServer)
+			_, err := readHeader(bufio.NewReader(iotest.OneByteReader(bytes.NewReader(tc.bytes))), tc.isServer)
 			var pe *protocolError
 			if !errors.As(err, &pe) {
 				t.Fatalf("readHeader err = %v, want *protocolError", err)
@@ -102,7 +106,7 @@ func TestReadHeaderProtocolError(t *testing.T) {
 }
 
 // TestReadHeaderTruncated checks that a transport cut short surfaces the raw
-// I/O error (never a *protocolError), at each point ReadFull is used: io.EOF
+// I/O error (never a *protocolError), at each point the header is cut: io.EOF
 // only at a clean frame boundary, io.ErrUnexpectedEOF once the frame has
 // begun.
 func TestReadHeaderTruncated(t *testing.T) {
@@ -122,7 +126,7 @@ func TestReadHeaderTruncated(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := readHeader(iotest.OneByteReader(bytes.NewReader(tc.bytes)), tc.isServer)
+			_, err := readHeader(bufio.NewReader(iotest.OneByteReader(bytes.NewReader(tc.bytes))), tc.isServer)
 			if _, ok := errors.AsType[*protocolError](err); ok {
 				t.Fatalf("readHeader err = %v, want I/O error not *protocolError", err)
 			}
@@ -307,6 +311,30 @@ func TestMaskCopy(t *testing.T) {
 			maskCopy(inPlace, inPlace, key, pos)
 			if !bytes.Equal(inPlace, want) {
 				t.Errorf("n=%d pos=%d: in-place result mismatch", n, pos)
+			}
+		}
+	}
+}
+
+func TestReadHeaderDoesNotAllocate(t *testing.T) {
+	// readHeader runs once per frame, so it must not allocate. Cover each
+	// length encoding, with and without a mask key.
+	key := [4]byte{1, 2, 3, 4}
+	for _, payloadLen := range []int{5, 126, 0x10000} {
+		for _, senderIsServer := range []bool{false, true} {
+			var hdr [maxHeaderLen]byte
+			n := buildHeader(hdr[:], senderIsServer, opBinary, true, payloadLen, key)
+			r := bytes.NewReader(nil)
+			br := bufio.NewReader(r)
+			allocs := testing.AllocsPerRun(1000, func() {
+				r.Reset(hdr[:n])
+				br.Reset(r)
+				if _, err := readHeader(br, !senderIsServer); err != nil {
+					t.Fatalf("readHeader: %v", err)
+				}
+			})
+			if allocs != 0 {
+				t.Errorf("payloadLen=%d senderIsServer=%v: readHeader allocates %v times, want 0", payloadLen, senderIsServer, allocs)
 			}
 		}
 	}
