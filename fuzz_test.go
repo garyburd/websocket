@@ -316,10 +316,21 @@ func FuzzClosePayload(f *testing.F) {
 // FuzzMaskCopy checks maskCopy (out-of-place and in-place) against the
 // naive per-byte reference (refMask) for arbitrary payloads, keys, and
 // starting positions.
+//
+// The SIMD implementation is built only with GOEXPERIMENT=simd; fuzz both
+// builds. It handles buffers of 64 bytes or more, so the seeds straddle 64
+// and the multiples of the vector widths above it.
 func FuzzMaskCopy(f *testing.F) {
 	f.Add([]byte("hello, world!"), byte(0x37), byte(0xfa), byte(0x21), byte(0x3d), 0)
 	f.Add(bytes.Repeat([]byte("0123456789"), 13), byte(1), byte(2), byte(3), byte(4), 2)
 	f.Add([]byte(nil), byte(0), byte(0), byte(0), byte(0), 0)
+	for i, n := range []int{63, 64, 65, 72, 79, 80, 95, 96, 127, 128, 129, 200} {
+		b := make([]byte, n)
+		for j := range b {
+			b[j] = byte(j)
+		}
+		f.Add(b, byte(0x37), byte(0xfa), byte(0x21), byte(0x3d), i%4)
+	}
 
 	f.Fuzz(func(t *testing.T, b []byte, k0, k1, k2, k3 byte, pos int) {
 		key := [4]byte{k0, k1, k2, k3}
