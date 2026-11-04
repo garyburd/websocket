@@ -4,18 +4,20 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 	"unicode/utf8"
 )
 
 // sinkRWC serves r on Read (then io.EOF) and discards everything written, so
 // the read path's best-effort close/pong echoes never block. Close is a no-op.
-type sinkRWC struct{ r *bytes.Reader }
+type sinkRWC struct{ r io.Reader }
 
 func (s *sinkRWC) Read(p []byte) (int, error)  { return s.r.Read(p) }
 func (s *sinkRWC) Write(p []byte) (int, error) { return len(p), nil }
@@ -82,51 +84,261 @@ func FuzzReadInbound(f *testing.F) {
 	})
 }
 
-// FuzzRoundTrip writes a message through a client and reads it back through a
-// server, requiring the type and payload to survive the encode/decode round
-// trip across length-boundary sizes and buffer sizes. A text payload that is
-// not valid UTF-8 must instead be rejected on read (RFC 6455 §8.1), so this
-// also fuzzes the streaming inbound validator end to end.
-func FuzzRoundTrip(f *testing.F) {
-	f.Add([]byte("hello"), false, 4096)
-	f.Add([]byte(nil), true, 64)
-	f.Add(bytes.Repeat([]byte("x"), 125), false, 128)   // 7-bit length boundary
-	f.Add(bytes.Repeat([]byte("y"), 126), true, 130)    // 16-bit length boundary
-	f.Add(bytes.Repeat([]byte("z"), 65536), false, 256) // 64-bit length boundary
+// chunkReader limits each Read to the next size in plan, 1 to 256 bytes,
+// cycling through it, so the reader sees the short reads a slow transport
+// produces. An empty plan does not limit reads.
+type chunkReader struct {
+	r    io.Reader
+	plan []byte
+	i    int
+}
 
-	f.Fuzz(func(t *testing.T, payload []byte, binary bool, bufSize int) {
-		if len(payload) > 1<<20 {
-			payload = payload[:1<<20] // within MaxMessageSize so the read isn't rejected
+func (c *chunkReader) Read(p []byte) (int, error) {
+	if len(c.plan) > 0 && len(p) > 0 {
+		p = p[:min(1+int(c.plan[c.i%len(c.plan)]), len(p))]
+		c.i++
+	}
+	return c.r.Read(p)
+}
+
+// wireFrame is one frame decoded by parseWire.
+type wireFrame struct {
+	fin     bool
+	opcode  int
+	payload []byte
+}
+
+// parseWire decodes the frames in b independently of the package's parser.
+// masked requires client masking and removes it; otherwise frames must be
+// unmasked.
+func parseWire(b []byte, masked bool) ([]wireFrame, error) {
+	var frames []wireFrame
+	for len(b) > 0 {
+		if len(b) < 2 {
+			return nil, errors.New("truncated header")
+		}
+		f := wireFrame{fin: b[0]&0x80 != 0, opcode: int(b[0] & 0x0f)}
+		if b[0]&0x70 != 0 {
+			return nil, errors.New("RSV bits set")
+		}
+		if got := b[1]&0x80 != 0; got != masked {
+			return nil, fmt.Errorf("mask bit %v, want %v", got, masked)
+		}
+		n, rest := uint64(b[1]&0x7f), b[2:]
+		switch n {
+		case 126:
+			if len(rest) < 2 {
+				return nil, errors.New("truncated 16-bit length")
+			}
+			if n = uint64(rest[0])<<8 | uint64(rest[1]); n < 126 {
+				return nil, errors.New("non-minimal 16-bit length")
+			}
+			rest = rest[2:]
+		case 127:
+			if len(rest) < 8 {
+				return nil, errors.New("truncated 64-bit length")
+			}
+			n = 0
+			for _, c := range rest[:8] {
+				n = n<<8 | uint64(c)
+			}
+			if n <= 0xffff || n>>63 != 0 {
+				return nil, errors.New("invalid 64-bit length")
+			}
+			rest = rest[8:]
+		}
+		var key []byte
+		if masked {
+			if len(rest) < 4 {
+				return nil, errors.New("truncated mask key")
+			}
+			key, rest = rest[:4], rest[4:]
+		}
+		if uint64(len(rest)) < n {
+			return nil, errors.New("truncated payload")
+		}
+		f.payload = bytes.Clone(rest[:n])
+		for i := range key {
+			for j := i; j < len(f.payload); j += 4 {
+				f.payload[j] ^= key[i]
+			}
+		}
+		frames = append(frames, f)
+		b = rest[n:]
+	}
+	return frames, nil
+}
+
+// messageFromFrames checks that frames form exactly one message of the
+// given opcode and returns its payload: a data opcode first, continuations
+// after it, FIN on the last frame only, and no empty frame before the last.
+func messageFromFrames(frames []wireFrame, opcode int) ([]byte, error) {
+	if len(frames) == 0 {
+		return nil, errors.New("no frames")
+	}
+	var payload []byte
+	for i, f := range frames {
+		want := opContinuation
+		if i == 0 {
+			want = opcode
+		}
+		last := i == len(frames)-1
+		switch {
+		case f.opcode != want:
+			return nil, fmt.Errorf("frame %d: opcode %d, want %d", i, f.opcode, want)
+		case f.fin != last:
+			return nil, fmt.Errorf("frame %d of %d: fin %v", i, len(frames), f.fin)
+		case !last && len(f.payload) == 0:
+			return nil, fmt.Errorf("frame %d of %d: empty non-final frame", i, len(frames))
+		}
+		payload = append(payload, f.payload...)
+	}
+	return payload, nil
+}
+
+// writePlanned writes payload as one message, following plan two bytes per
+// call: the first byte picks Write, WriteString, ReadFrom (from a source
+// that returns half of each request), or Final followed by one last write
+// of the rest; the second byte's square is the call's size. Once plan runs
+// out, one Write sends the rest.
+func writePlanned(w *Writer, payload, plan []byte) error {
+	for i := 0; len(payload) > 0; i += 2 {
+		if i+1 >= len(plan) {
+			if n, err := w.Write(payload); err != nil || n != len(payload) {
+				return fmt.Errorf("Write(%d bytes) = %d, %v", len(payload), n, err)
+			}
+			return nil
+		}
+		op, size := plan[i]%4, int(plan[i+1])*int(plan[i+1])
+		if op == 3 {
+			w.Final()
+			size = len(payload)
+		}
+		chunk := payload[:min(size, len(payload))]
+		payload = payload[len(chunk):]
+		var n int64
+		var err error
+		switch {
+		case op == 0 || op == 3 && plan[i+1]&1 == 0:
+			var k int
+			k, err = w.Write(chunk)
+			n = int64(k)
+		case op == 1 || op == 3:
+			var k int
+			k, err = w.WriteString(string(chunk))
+			n = int64(k)
+		default:
+			n, err = w.ReadFrom(iotest.HalfReader(bytes.NewReader(chunk)))
+		}
+		if err != nil || n != int64(len(chunk)) {
+			return fmt.Errorf("op %d (%d bytes) = %d, %v", op, len(chunk), n, err)
+		}
+		if op == 3 {
+			return nil
+		}
+	}
+	return nil
+}
+
+// readPlanned reads one message. Without stream it uses ReadMessage.
+// Otherwise it reads the payload with Reader.Read, sizing each buffer
+// (1 to 256 bytes) from plan, and a plan byte divisible by 8 reads the rest
+// with WriteTo instead.
+func readPlanned(c *Conn, stream bool, plan []byte) ([]byte, MessageType, error) {
+	if !stream {
+		return c.ReadMessage(nil)
+	}
+	var got []byte
+	var mt MessageType
+	err := c.Read(nil, func(r *Reader) error {
+		mt = r.Type()
+		for i := 0; ; i++ {
+			size := 512
+			if len(plan) > 0 {
+				b := plan[len(plan)-1-i%len(plan)]
+				if b%8 == 0 {
+					var buf bytes.Buffer
+					_, err := r.WriteTo(&buf)
+					got = append(got, buf.Bytes()...)
+					return err
+				}
+				size = 1 + int(b)
+			}
+			buf := make([]byte, size)
+			n, err := r.Read(buf)
+			got = append(got, buf[:n]...)
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		}
+	})
+	return got, mt, err
+}
+
+// FuzzRoundTrip writes a message through one endpoint and reads it back
+// through the other, requiring the type and payload to survive. The input
+// picks the direction, the writer's buffer size and its sequence of Write,
+// WriteString, ReadFrom, and Final calls, how many bytes each transport read
+// returns, and whether the reader uses ReadMessage or streams with Read and
+// WriteTo. An independent decoder checks the frames the writer produced. A
+// text payload that is not valid UTF-8 must instead be rejected on read
+// (RFC 6455 §8.1), which fuzzes the streaming validator across frame,
+// buffer, and transport-read boundaries.
+func FuzzRoundTrip(f *testing.F) {
+	f.Add([]byte("hello"), false, false, false, 4096, []byte(nil), []byte(nil))
+	f.Add([]byte(nil), true, true, true, 64, []byte(nil), []byte{1})
+	f.Add(bytes.Repeat([]byte("x"), 125), false, false, true, 128, []byte{0, 5, 1, 7, 2, 9}, []byte{0, 3})                         // 7-bit length boundary
+	f.Add(bytes.Repeat([]byte("y"), 126), true, true, false, 130, []byte{2, 11, 3, 1}, []byte{200})                                // 16-bit length boundary
+	f.Add(bytes.Repeat([]byte("z"), 65536), false, true, true, 256, []byte{1, 255, 0, 100}, []byte{255, 16})                       // 64-bit length boundary
+	f.Add([]byte("h\xc3\xa9llo \xe2\x82\xac \xf0\x9f\x98\x80"), false, false, true, 64, []byte{0, 1, 1, 2, 2, 3}, []byte{0, 1, 2}) // UTF-8 split everywhere
+	f.Add([]byte("abc\xf4\x90\x80\x80def"), false, true, true, 64, []byte{0, 2}, []byte{0, 1})                                     // invalid UTF-8 (Autobahn 6.4.3)
+
+	f.Fuzz(func(t *testing.T, payload []byte, isBinary, fromServer, stream bool, bufSize int, writePlan, readPlan []byte) {
+		if len(payload) > 1<<17 {
+			payload = payload[:1<<17] // bound the cost of byte-at-a-time plans
 		}
 		bufSize &= 0xffff // 0..64 KiB; newConn clamps anything below the minimum up
 
-		mt := MessageText
-		if binary {
-			mt = MessageBinary
+		mt, opcode := MessageText, opText
+		if isBinary {
+			mt, opcode = MessageBinary, opBinary
 		}
 
-		var buf bytes.Buffer
-		client := newConn(&captureRWC{w: &buf}, nil, connConfig{
+		var wire bytes.Buffer
+		writer := newConn(&captureRWC{w: &wire}, nil, connConfig{
+			isServer:            fromServer,
 			controlReplyTimeout: time.Hour,
 			shutdownTimeout:     time.Hour,
 			maxMessageSize:      1 << 20,
 			writeBufferSize:     bufSize,
 		})
-		if err := client.WriteMessage(context.Background(), mt, nil, payload); err != nil {
-			t.Fatalf("WriteMessage: %v", err)
+		err := writer.Write(context.Background(), mt, nil, func(w *Writer) error {
+			return writePlanned(w, payload, writePlan)
+		})
+		writer.Close()
+		if err != nil {
+			t.Fatalf("Write: %v", err)
 		}
-		client.Close()
 
-		server := fuzzConn(&sinkRWC{r: bytes.NewReader(buf.Bytes())}, true, 4096)
-		gotMsg, gotType, err := server.ReadMessage(nil)
-		server.Close()
+		frames, err := parseWire(wire.Bytes(), !fromServer)
+		if err != nil {
+			t.Fatalf("parseWire: %v", err)
+		}
+		sent, err := messageFromFrames(frames, opcode)
+		if err != nil {
+			t.Fatalf("frames: %v", err)
+		}
+		if !bytes.Equal(sent, payload) {
+			t.Fatalf("frames carry %d bytes, want the %d-byte payload", len(sent), len(payload))
+		}
 
-		// Inbound text is validated as UTF-8 (RFC 6455 §8.1), incrementally
-		// across whatever frame and buffer boundaries this payload/bufSize
-		// produced. An invalid text payload must be rejected as a protocol
-		// error rather than round-tripped; anything else must round-trip
-		// intact. This makes the read-path validator agree with utf8.Valid
-		// over fuzzed input.
+		reader := fuzzConn(&sinkRWC{r: &chunkReader{r: bytes.NewReader(wire.Bytes()), plan: readPlan}}, !fromServer, 4096)
+		got, gotType, err := readPlanned(reader, stream, readPlan)
+		reader.Close()
+
 		if mt == MessageText && !utf8.Valid(payload) {
 			if !errors.Is(err, ErrProtocol) {
 				t.Fatalf("invalid-UTF-8 text: err = %v, want ErrProtocol", err)
@@ -134,13 +346,13 @@ func FuzzRoundTrip(f *testing.F) {
 			return
 		}
 		if err != nil {
-			t.Fatalf("ReadMessage: %v", err)
+			t.Fatalf("read: %v", err)
 		}
 		if gotType != mt {
 			t.Errorf("type = %v, want %v", gotType, mt)
 		}
-		if !bytes.Equal(gotMsg, payload) {
-			t.Errorf("payload mismatch: got %d bytes, want %d", len(gotMsg), len(payload))
+		if !bytes.Equal(got, payload) {
+			t.Errorf("payload mismatch: got %d bytes, want %d", len(got), len(payload))
 		}
 	})
 }
