@@ -880,6 +880,8 @@ func closePayload(code CloseCode, reason string) (_ []byte, err error) {
 }
 
 // Read reads message payload and returns [io.EOF] at the message boundary.
+// Like any [io.Reader], it may return fewer than len(p) bytes: it returns the
+// payload that has arrived rather than waiting for more.
 func (r *Reader) Read(p []byte) (int, error) {
 	c := r.c
 	if c == nil {
@@ -914,24 +916,36 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if m.rateMode {
 		c.monitor.beginFill(want)
 	}
-	n, err := readFull(c.br, p[:want])
-	if err == nil && m.rateMode {
-		c.monitor.endFill(n)
-	}
+	// Return what has arrived rather than waiting to fill p, so a stalled
+	// frame's payload is delivered, and invalid text rejected, as it arrives.
+	n, err := c.br.Read(p[:want])
 	if c.isServer && m.maskKey != ([4]byte{}) {
 		m.maskPos = maskCopy(p[:n], p[:n], m.maskKey, m.maskPos)
 	}
 	m.remaining -= n
-	if err != nil {
-		m.err = c.terminateRead(err)
-		return n, m.err
+	if err != nil && m.remaining == 0 {
+		// The frame's payload is complete. As with io.ReadFull, an error
+		// returned with the last bytes is left to the next read.
+		err = nil
 	}
+	// Validate before handling a read error, so text returned alongside one
+	// has been checked too. Rejected text is not returned at all.
 	if m.validateUTF8 && m.opcode == opText {
 		m.utf8State = utf8Validate(m.utf8State, p[:n])
 		if m.utf8State == utf8Reject {
 			m.err = c.terminateRead(peerError(CloseInvalidData, "invalid UTF-8 in text message"))
-			return n, m.err
+			return 0, m.err
 		}
+	}
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF // payload remains
+		}
+		m.err = c.terminateRead(err)
+		return n, m.err
+	}
+	if m.rateMode {
+		c.monitor.endFill(n)
 	}
 	if c.bodyBuffered() {
 		c.monitor.endBody()

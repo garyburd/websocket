@@ -1795,6 +1795,33 @@ func TestReadCompletePayloadWithError(t *testing.T) {
 	}
 }
 
+func TestReadInvalidTextWithError(t *testing.T) {
+	// Invalid text that arrives together with a transport error, before the
+	// frame is complete, is still validated: Read rejects it rather than
+	// returning it alongside the transport error.
+	payload := append(bytes.Repeat([]byte("x"), 299), 0xff)
+	var header [maxHeaderLen]byte
+	n := buildHeader(header[:], true, opText, true, len(payload)+100, [4]byte{})
+	rwc := &payloadErrorRWC{
+		header:     bytes.Clone(header[:n]),
+		payload:    payload, // exceeds the internal buffer, so it is read directly
+		payloadErr: io.EOF,
+	}
+	c := newTestConn(t, rwc)
+
+	err := c.Read(nil, func(r *Reader) error {
+		buf := make([]byte, 512)
+		n, err := r.Read(buf)
+		if n != 0 {
+			t.Errorf("Read returned %d bytes of invalid text", n)
+		}
+		return err
+	})
+	if !errors.Is(err, ErrProtocol) || errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("Read = %v, want ErrProtocol for invalid UTF-8", err)
+	}
+}
+
 func TestZeroMaxMessageSizeUnlimited(t *testing.T) {
 	// maxMsg == 0 imposes no limit beyond the protocol's: a message
 	// larger than the former 1 MiB default reads in full.
@@ -2736,5 +2763,73 @@ func TestControlFrameDoesNotAllocate(t *testing.T) {
 		if allocs != 0 {
 			t.Errorf("handling opcode %d allocates %v times, want 0", op, allocs)
 		}
+	}
+}
+
+func TestInvalidUTF8RejectedBeforeFrameCompletes(t *testing.T) {
+	// Autobahn 6.4.3: one text frame whose payload arrives in chops. The
+	// second chop makes the text invalid (U+110000), and the read must fail
+	// as soon as it arrives, not after the rest of the frame.
+	prefix := []byte("\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5\xf4\x90\x80\x80")
+	const rest = "edited"
+	for _, rd := range []struct {
+		name string
+		read func(c *Conn) error
+	}{
+		{"ReadMessage", func(c *Conn) error {
+			_, _, err := c.ReadMessage(nil)
+			return err
+		}},
+		{"WriteTo", func(c *Conn) error {
+			return c.Read(nil, func(r *Reader) error {
+				_, err := r.WriteTo(io.Discard)
+				return err
+			})
+		}},
+	} {
+		t.Run(rd.name, func(t *testing.T) {
+			c, peer := connPair(t)
+			errCh := make(chan error, 1)
+			go func() { errCh <- rd.read(c) }()
+
+			// The rest of the frame is never sent.
+			hdr := []byte{0x81, byte(len(prefix) + len(rest))}
+			if _, err := peer.Write(append(hdr, prefix...)); err != nil {
+				t.Fatalf("peer write: %v", err)
+			}
+			peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+			f := readPeerFrame(t, peer)
+			if f.opcode != opClose || len(f.payload) < 2 || CloseCode(binary.BigEndian.Uint16(f.payload)) != CloseInvalidData {
+				t.Fatalf("peer got %+v, want close %d before the frame completes", f, CloseInvalidData)
+			}
+			if err := <-errCh; !errors.Is(err, ErrProtocol) {
+				t.Errorf("read err = %v, want ErrProtocol", err)
+			}
+		})
+	}
+}
+
+func TestReaderReadReturnsAvailablePayload(t *testing.T) {
+	// Read returns the payload that has arrived instead of waiting to fill p,
+	// so a slow frame is validated and delivered as it arrives.
+	c, peer := connPair(t)
+	go func() {
+		peer.Write([]byte{0x82, 10, 'a', 'b', 'c', 'd'}) // 6 of 10 bytes withheld
+	}()
+	got := make(chan string, 1)
+	go c.Read(nil, func(r *Reader) error {
+		buf := make([]byte, 10)
+		n, _ := r.Read(buf)
+		got <- string(buf[:n])
+		return r.Abort(CloseNormalClosure, "")
+	})
+	go drainPeer(peer)
+	select {
+	case s := <-got:
+		if s != "abcd" {
+			t.Errorf("Read returned %q, want %q", s, "abcd")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read waited for the rest of the frame")
 	}
 }
