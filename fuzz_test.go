@@ -246,10 +246,19 @@ func FuzzDialResponse(f *testing.F) {
 			opts.Subprotocols = []string{offered}
 		}
 
-		c, _, err := Dial(context.Background(), "ws://example.com/", opts, nil)
+		c, resp, err := Dial(context.Background(), "ws://example.com/", opts, nil)
 		if err != nil {
 			if c != nil {
 				t.Fatal("Dial returned both a Conn and an error")
+			}
+			if resp == nil {
+				return // rejected before the request, e.g. an invalid offer
+			}
+			if !errors.Is(err, ErrBadHandshake) {
+				t.Fatalf("Dial err = %v, want ErrBadHandshake", err)
+			}
+			if got, want := errors.Is(err, ErrBadStatus), status != 101; got != want {
+				t.Fatalf("status %d: errors.Is(%v, ErrBadStatus) = %v, want %v", status, err, got, want)
 			}
 			return
 		}

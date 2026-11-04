@@ -21,8 +21,9 @@ import (
 // [ReadOptions], and [WriteOptions] after Dial returns.
 //
 // Dial does not follow redirects. A response other than 101 returns
-// [ErrBadHandshake] and the response with up to
-// [DialOptions.ResponseBodyLimit] body bytes. On success, the [Conn] owns the
+// [ErrBadStatus] and the response with up to [DialOptions.ResponseBodyLimit]
+// body bytes. A 101 response that fails validation returns [ErrBadHandshake]
+// and the response with an empty body. On success, the [Conn] owns the
 // response body. The caller need not close either returned body.
 func Dial(ctx context.Context, rawURL string, opts *DialOptions, header http.Header) (*Conn, *http.Response, error) {
 	if opts == nil {
@@ -79,13 +80,20 @@ func Dial(ctx context.Context, rawURL string, opts *DialOptions, header http.Hea
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		captureResponseBody(resp, opts.ResponseBodyLimit)
-		return nil, resp, http2Hint(rt, fmt.Errorf("%w: status %d", ErrBadHandshake, resp.StatusCode))
+		return nil, resp, http2Hint(rt, fmt.Errorf("%w %d", ErrBadStatus, resp.StatusCode))
 	}
-	if !tokenListHas(resp.Header.Values("Upgrade"), "websocket") ||
-		!tokenListHas(resp.Header.Values("Connection"), "upgrade") ||
-		resp.Header.Get("Sec-Websocket-Accept") != computeAcceptKey(challenge) {
+	var invalid string
+	switch {
+	case !tokenListHas(resp.Header.Values("Upgrade"), "websocket"):
+		invalid = "response missing Upgrade: websocket"
+	case !tokenListHas(resp.Header.Values("Connection"), "upgrade"):
+		invalid = "response missing Connection: upgrade"
+	case resp.Header.Get("Sec-Websocket-Accept") != computeAcceptKey(challenge):
+		invalid = "response Sec-WebSocket-Accept does not match Sec-WebSocket-Key"
+	}
+	if invalid != "" {
 		captureResponseBody(resp, opts.ResponseBodyLimit)
-		return nil, resp, fmt.Errorf("%w: status %d", ErrBadHandshake, resp.StatusCode)
+		return nil, resp, fmt.Errorf("%w: %s", ErrBadHandshake, invalid)
 	}
 	// No WebSocket extensions are implemented.
 	if ext := resp.Header.Get("Sec-Websocket-Extensions"); ext != "" {

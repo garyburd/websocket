@@ -59,6 +59,12 @@ var (
 	// wrap it with details.
 	ErrBadHandshake = errors.New("websocket: bad handshake")
 
+	// ErrBadStatus reports a [Dial] response with a status other than 101
+	// Switching Protocols, such as an HTTP rejection or redirect. It wraps
+	// [ErrBadHandshake]. A 101 response that fails validation matches only
+	// ErrBadHandshake.
+	ErrBadStatus = fmt.Errorf("%w: unexpected status", ErrBadHandshake)
+
 	// ErrCloseSent reports a data write attempted after this endpoint sent a
 	// close frame.
 	ErrCloseSent = errors.New("websocket: cannot write after close")

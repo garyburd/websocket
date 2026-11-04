@@ -151,8 +151,8 @@ func TestDialCapturesFailureBody(t *testing.T) {
 				c.Close()
 				t.Fatal("Dial returned a non-nil Conn on handshake failure")
 			}
-			if !errors.Is(err, ErrBadHandshake) {
-				t.Fatalf("Dial error = %v, want ErrBadHandshake", err)
+			if !errors.Is(err, ErrBadStatus) {
+				t.Fatalf("Dial error = %v, want ErrBadStatus", err)
 			}
 			if resp == nil {
 				t.Fatal("Dial returned a nil response on handshake failure")
@@ -175,7 +175,7 @@ func TestDialCapturesFailureBody(t *testing.T) {
 func TestDialRefusesRedirect(t *testing.T) {
 	// The default client must not follow a 3xx (it cannot carry the 101
 	// upgrade and may cross origins). The redirect surfaces as an
-	// ErrBadHandshake with the 3xx status, not a followed request.
+	// ErrBadStatus with the 3xx status, not a followed request.
 	var hits int
 	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -188,8 +188,8 @@ func TestDialRefusesRedirect(t *testing.T) {
 		c.Close()
 		t.Fatal("Dial returned a non-nil Conn for a redirect")
 	}
-	if !errors.Is(err, ErrBadHandshake) {
-		t.Fatalf("Dial err = %v, want ErrBadHandshake", err)
+	if !errors.Is(err, ErrBadStatus) {
+		t.Fatalf("Dial err = %v, want ErrBadStatus", err)
 	}
 	if resp == nil || resp.StatusCode != http.StatusFound {
 		t.Fatalf("resp = %v, want status %d", resp, http.StatusFound)
@@ -237,16 +237,20 @@ func TestDialHTTP2Hint(t *testing.T) {
 }
 
 // TestDialMalformed101 covers 101 responses that fail Dial's vetting: each is
-// a handshake failure matching ErrBadHandshake, and the body — the upgraded
+// a handshake failure matching ErrBadHandshake but not ErrBadStatus, its
+// error names the failed check, and the body — the upgraded
 // connection, not an HTTP error body — is never captured even with
 // ResponseBodyLimit set, since reading it could block past the handshake.
 func TestDialMalformed101(t *testing.T) {
 	cases := []struct {
 		name string
 		rt   *dialResponseRT
+		want string // in the error text
 	}{
-		{"BadAcceptKey", &dialResponseRT{status: 101, upgrade: "websocket", connection: "Upgrade", accept: "bogus"}},
-		{"UnwritableBody", &dialResponseRT{status: 101, upgrade: "websocket", connection: "Upgrade", echoAccept: true}},
+		{"MissingUpgrade", &dialResponseRT{status: 101, upgrade: "h2c", connection: "Upgrade", echoAccept: true}, "Upgrade: websocket"},
+		{"MissingConnection", &dialResponseRT{status: 101, upgrade: "websocket", connection: "keep-alive", echoAccept: true}, "Connection: upgrade"},
+		{"BadAcceptKey", &dialResponseRT{status: 101, upgrade: "websocket", connection: "Upgrade", accept: "bogus"}, "Sec-WebSocket-Accept"},
+		{"UnwritableBody", &dialResponseRT{status: 101, upgrade: "websocket", connection: "Upgrade", echoAccept: true}, "not writable"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -256,8 +260,11 @@ func TestDialMalformed101(t *testing.T) {
 				c.Close()
 				t.Fatal("Dial returned a non-nil Conn for a malformed 101")
 			}
-			if !errors.Is(err, ErrBadHandshake) {
-				t.Fatalf("Dial err = %v, want ErrBadHandshake", err)
+			if !errors.Is(err, ErrBadHandshake) || errors.Is(err, ErrBadStatus) {
+				t.Fatalf("Dial err = %v, want ErrBadHandshake and not ErrBadStatus", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Dial err = %v, want it to mention %q", err, tc.want)
 			}
 			if got, err := io.ReadAll(resp.Body); err != nil || len(got) != 0 {
 				t.Errorf("captured body = %q, %v; want empty (101 bodies are never read)", got, err)
