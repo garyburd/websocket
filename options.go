@@ -168,7 +168,25 @@ var (
 	errWriteOptsConflict           = fmt.Errorf("%w: WriteOptions: MessageTimeout and MinWriteRate are mutually exclusive", ErrInvalidArgument)
 	errReadOptsNegative            = fmt.Errorf("%w: ReadOptions: durations and rates must not be negative", ErrInvalidArgument)
 	errWriteOptsNegative           = fmt.Errorf("%w: WriteOptions: durations and rates must not be negative", ErrInvalidArgument)
+	errDialOptsNegative            = fmt.Errorf("%w: DialOptions: durations and sizes must not be negative", ErrInvalidArgument)
+	errUpgradeOptsNegative         = fmt.Errorf("%w: UpgradeOptions: durations and sizes must not be negative", ErrInvalidArgument)
 )
+
+func (o *DialOptions) validate() error {
+	if o.ControlReplyTimeout < 0 || o.ShutdownTimeout < 0 || o.MaxMessageSize < 0 ||
+		o.WriteBufferSize < 0 || o.ResponseBodyLimit < 0 {
+		return errDialOptsNegative
+	}
+	return nil
+}
+
+func (o *UpgradeOptions) validate() error {
+	if o.ControlReplyTimeout < 0 || o.ShutdownTimeout < 0 || o.MaxMessageSize < 0 ||
+		o.WriteBufferSize < 0 {
+		return errUpgradeOptsNegative
+	}
+	return nil
+}
 
 func (o *ReadOptions) validate() error {
 	if o == nil {

@@ -40,6 +40,22 @@ func TestDialRejectsManagedHeader(t *testing.T) {
 	}
 }
 
+func TestDialRejectsNegativeOptions(t *testing.T) {
+	// Caught before any network I/O, so this needs no server.
+	for name, opts := range map[string]*DialOptions{
+		"ControlReplyTimeout": {ControlReplyTimeout: -1},
+		"ShutdownTimeout":     {ShutdownTimeout: -1},
+		"MaxMessageSize":      {MaxMessageSize: -1},
+		"WriteBufferSize":     {WriteBufferSize: -1},
+		"ResponseBodyLimit":   {ResponseBodyLimit: -1},
+	} {
+		_, _, err := Dial(context.Background(), "ws://example.invalid/", opts, nil)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("Dial with negative %s err = %v, want ErrInvalidArgument", name, err)
+		}
+	}
+}
+
 func TestDialRejectsInvalidSubprotocol(t *testing.T) {
 	// Subprotocol names are joined into one comma-separated header value, so
 	// a name that is not an HTTP token (a comma or space inside it, an empty

@@ -1385,7 +1385,7 @@ func (c *Conn) Shutdown(code CloseCode, reason string) error {
 	// records the reason before its shutdownTimer.Stop, so a Stop racing this
 	// Reset is covered in both orders — either it stops our arm, or the
 	// recheck sees the reason and stops it.
-	if timeout != 0 {
+	if timeout > 0 {
 		if !deadline.After(time.Now()) {
 			c.terminateConn(errShutdownTimeout)
 			return argErr

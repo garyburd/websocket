@@ -31,6 +31,9 @@ func Dial(ctx context.Context, rawURL string, opts *DialOptions, header http.Hea
 	if opts == nil {
 		opts = &DialOptions{}
 	}
+	if err := opts.validate(); err != nil {
+		return nil, nil, err
+	}
 	for k := range header {
 		if isManagedHeader(k) {
 			return nil, nil, fmt.Errorf("%w: header must not set %q, which Dial manages", ErrInvalidArgument, k)

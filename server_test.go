@@ -321,6 +321,32 @@ func TestUpgradeResponseHeaderSpelling(t *testing.T) {
 	}
 }
 
+func TestUpgradeRejectsNegativeOptions(t *testing.T) {
+	for name, opts := range map[string]*UpgradeOptions{
+		"ControlReplyTimeout": {ControlReplyTimeout: -1},
+		"ShutdownTimeout":     {ShutdownTimeout: -1},
+		"MaxMessageSize":      {MaxMessageSize: -1},
+		"WriteBufferSize":     {WriteBufferSize: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.Header.Set("Connection", "Upgrade")
+			r.Header.Set("Upgrade", "websocket")
+			r.Header.Set("Sec-WebSocket-Version", "13")
+			r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+			w := httptest.NewRecorder()
+
+			_, err := Upgrade(w, r, opts)
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("Upgrade err = %v, want ErrInvalidArgument", err)
+			}
+			if w.Code != http.StatusInternalServerError {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+			}
+		})
+	}
+}
+
 func TestUpgradeRejectsManagedResponseHeader(t *testing.T) {
 	// ResponseHeader must not set a header Upgrade manages. Keys are matched
 	// case-insensitively, since callers can assign the map directly.
