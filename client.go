@@ -15,9 +15,7 @@ import (
 // such as Origin, Cookie, and Authorization.
 //
 // header must not set Upgrade, Connection, or Sec-WebSocket-* headers, which
-// Dial manages; if it does, Dial returns an error that wraps
-// [ErrInvalidArgument]. Configure subprotocols through
-// [DialOptions.Subprotocols].
+// Dial manages. Configure subprotocols through [DialOptions.Subprotocols].
 //
 // ctx bounds only the handshake. Use [Conn.Shutdown], [Conn.Close],
 // [ReadOptions], and [WriteOptions] after Dial returns.
@@ -66,7 +64,7 @@ func Dial(ctx context.Context, rawURL string, opts *DialOptions, header http.Hea
 
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("websocket: build request: %w", err)
+		return nil, nil, fmt.Errorf("%w: build request: %w", ErrInvalidArgument, err)
 	}
 	if header != nil {
 		req.Header = header.Clone()
@@ -115,8 +113,12 @@ func Dial(ctx context.Context, rawURL string, opts *DialOptions, header http.Hea
 	}
 	rwc, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
+		// The Transport, not the server, produced this body.
+		err := fmt.Errorf("%w: 101 response body of type %T is not writable; "+
+			"DialOptions.Transport must return an io.ReadWriteCloser body for a 101 response",
+			ErrInvalidArgument, resp.Body)
 		captureResponseBody(resp, opts.ResponseBodyLimit)
-		return nil, resp, fmt.Errorf("%w: response body is not writable", ErrBadHandshake)
+		return nil, resp, err
 	}
 
 	c := newConn(rwc, nil, connConfig{

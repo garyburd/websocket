@@ -56,8 +56,9 @@ var (
 	// ErrProtocol reports a peer protocol violation.
 	ErrProtocol = errors.New("websocket: protocol error")
 
-	// ErrBadHandshake reports a rejected opening handshake. [Dial] and [Upgrade]
-	// wrap it with details.
+	// ErrBadHandshake reports a protocol error in the peer's opening handshake.
+	// [Dial] and [Upgrade] wrap it with details. Network errors and local
+	// configuration errors do not wrap it.
 	ErrBadHandshake = errors.New("websocket: bad handshake")
 
 	// ErrBadStatus reports a [Dial] response with a status other than 101

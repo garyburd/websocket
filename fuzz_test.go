@@ -646,8 +646,9 @@ func wantUpgrade(r *http.Request, glob bool) int {
 // FuzzUpgradeHeaders drives the server handshake with arbitrary values in
 // every header Upgrade inspects, with the default host check and with a
 // glob CheckOrigin and subprotocol selection. An independent statement of
-// the rules says whether to accept. A rejection must return ErrBadHandshake
-// with the expected status. An acceptance must write a 101 response that
+// the rules says whether to accept. A rejection must return the expected
+// status, with ErrBadHandshake for a protocol error and without it for a
+// refused origin, which is the server's policy. An acceptance must write a 101 response that
 // net/http parses, with only the handshake headers, the RFC 6455 accept key
 // for the request's key, and the client's first supported subprotocol.
 func FuzzUpgradeHeaders(f *testing.F) {
@@ -682,8 +683,11 @@ func FuzzUpgradeHeaders(f *testing.F) {
 					c.Close()
 					t.Fatalf("glob=%v: Upgrade accepted, want status %d", glob, status)
 				}
-				if !errors.Is(err, ErrBadHandshake) || rec.Code != status {
-					t.Fatalf("glob=%v: Upgrade = %v with status %d, want ErrBadHandshake with %d", glob, err, rec.Code, status)
+				if err == nil || rec.Code != status {
+					t.Fatalf("glob=%v: Upgrade = %v with status %d, want an error with %d", glob, err, rec.Code, status)
+				}
+				if got, want := errors.Is(err, ErrBadHandshake), status != http.StatusForbidden; got != want {
+					t.Fatalf("glob=%v: status %d: errors.Is(%v, ErrBadHandshake) = %v, want %v", glob, status, err, got, want)
 				}
 				continue
 			}
@@ -800,6 +804,13 @@ func FuzzDialResponse(f *testing.F) {
 			}
 			if resp == nil {
 				return // rejected before the request, e.g. an invalid offer
+			}
+			if errors.Is(err, ErrInvalidArgument) {
+				// Only the Transport's unwritable body is a local error.
+				if errors.Is(err, ErrBadHandshake) || status != 101 || writableBody {
+					t.Fatalf("Dial err = %v for status %d, writable body %v; want ErrInvalidArgument only for an unwritable 101 body", err, status, writableBody)
+				}
+				return
 			}
 			if !errors.Is(err, ErrBadHandshake) {
 				t.Fatalf("Dial err = %v, want ErrBadHandshake", err)

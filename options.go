@@ -67,14 +67,12 @@ type UpgradeOptions struct {
 	CheckOrigin func(*http.Request) bool
 
 	// ResponseHeader adds headers to the 101 response. It must not set
-	// Upgrade, Connection, or Sec-WebSocket-* headers, which Upgrade manages;
-	// if it does, Upgrade responds with 500 Internal Server Error and returns
-	// an error that wraps both [ErrBadHandshake] and [ErrInvalidArgument].
+	// Upgrade, Connection, or Sec-WebSocket-* headers, which Upgrade manages.
 	ResponseHeader http.Header
 
-	// OnError writes a rejected handshake response. err wraps
-	// [ErrBadHandshake]. The callback must not hijack or write a success status.
-	// If nil, Upgrade uses [http.Error].
+	// OnError writes the response when Upgrade rejects a request. status is
+	// the HTTP status and err is the error Upgrade returns. The callback must
+	// not hijack or write a success status. If nil, Upgrade uses [http.Error].
 	OnError func(w http.ResponseWriter, r *http.Request, status int, err error)
 
 	// ControlReplyTimeout bounds automatic pong and close writes. Zero waits
@@ -184,6 +182,11 @@ func (o *UpgradeOptions) validate() error {
 	if o.ControlReplyTimeout < 0 || o.ShutdownTimeout < 0 || o.MaxMessageSize < 0 ||
 		o.WriteBufferSize < 0 {
 		return errUpgradeOptsNegative
+	}
+	for k := range o.ResponseHeader {
+		if isManagedHeader(k) {
+			return fmt.Errorf("%w: UpgradeOptions: ResponseHeader must not set %q, which Upgrade manages", ErrInvalidArgument, k)
+		}
 	}
 	return nil
 }

@@ -43,13 +43,6 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 	if err := opts.validate(); err != nil {
 		return reject(http.StatusInternalServerError, err, http.StatusText(http.StatusInternalServerError))
 	}
-	for k := range opts.ResponseHeader {
-		if isManagedHeader(k) {
-			err := fmt.Errorf("%w: %w: ResponseHeader must not set %q, which Upgrade manages",
-				ErrBadHandshake, ErrInvalidArgument, k)
-			return reject(http.StatusInternalServerError, err, http.StatusText(http.StatusInternalServerError))
-		}
-	}
 
 	if r.Method != http.MethodGet {
 		return fail(http.StatusMethodNotAllowed, fmt.Sprintf("method %q not allowed", r.Method))
@@ -73,7 +66,9 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 		check = sameHost
 	}
 	if !check(r) {
-		return fail(http.StatusForbidden, "forbidden origin")
+		// A refused origin is the server's policy, not a protocol error.
+		err := fmt.Errorf("websocket: forbidden origin %q", r.Header.Get("Origin"))
+		return reject(http.StatusForbidden, err, "forbidden origin")
 	}
 
 	var subprotocol string
@@ -97,15 +92,15 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 	// Hijack before committing the 101 so failure remains reportable over HTTP.
 	netConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
-		status := http.StatusInternalServerError
-		if r.ProtoMajor != 1 {
-			status = http.StatusBadRequest
-		}
-		return fail(status, fmt.Sprintf("hijack: %v", err))
+		// The request passed IsUpgradeRequest, so it is HTTP/1.x: HTTP/2 and
+		// later forbid the Connection and Upgrade headers. w cannot be
+		// hijacked, typically because middleware wraps it without Unwrap.
+		err = fmt.Errorf("%w: hijack connection: %w", ErrInvalidArgument, err)
+		return reject(http.StatusInternalServerError, err, http.StatusText(http.StatusInternalServerError))
 	}
 	if err := writeSwitchingProtocols(brw.Writer, h); err != nil {
 		netConn.Close()
-		return nil, fmt.Errorf("%w: write upgrade response: %v", ErrBadHandshake, err)
+		return nil, fmt.Errorf("websocket: write upgrade response: %w", err)
 	}
 	// Preserve bytes buffered beyond the request headers.
 	c := newConn(netConn, brw.Reader, connConfig{
@@ -210,10 +205,10 @@ func ParseOrigin(r *http.Request) (*url.URL, error) {
 	}
 	u, err := url.Parse(origin)
 	if err != nil {
-		return nil, fmt.Errorf("parse Origin %q: %w", origin, err)
+		return nil, fmt.Errorf("websocket: parse Origin %q: %w", origin, err)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("missing host in Origin %q", origin)
+		return nil, fmt.Errorf("websocket: missing host in Origin %q", origin)
 	}
 	return u, nil
 }

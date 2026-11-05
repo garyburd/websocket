@@ -264,7 +264,6 @@ func TestDialMalformed101(t *testing.T) {
 		{"MissingUpgrade", &dialResponseRT{status: 101, upgrade: "h2c", connection: "Upgrade", echoAccept: true}, "Upgrade: websocket"},
 		{"MissingConnection", &dialResponseRT{status: 101, upgrade: "websocket", connection: "keep-alive", echoAccept: true}, "Connection: upgrade"},
 		{"BadAcceptKey", &dialResponseRT{status: 101, upgrade: "websocket", connection: "Upgrade", accept: "bogus"}, "Sec-WebSocket-Accept"},
-		{"UnwritableBody", &dialResponseRT{status: 101, upgrade: "websocket", connection: "Upgrade", echoAccept: true}, "not writable"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -284,5 +283,30 @@ func TestDialMalformed101(t *testing.T) {
 				t.Errorf("captured body = %q, %v; want empty (101 bodies are never read)", got, err)
 			}
 		})
+	}
+}
+
+func TestDialUnwritableBody(t *testing.T) {
+	// The Transport, not the server, produces a 101 body that is not an
+	// io.ReadWriteCloser, so the error is not a peer handshake error.
+	rt := &dialResponseRT{status: 101, upgrade: "websocket", connection: "Upgrade", echoAccept: true}
+	c, _, err := Dial(context.Background(), "ws://example.com/", &DialOptions{Transport: rt}, nil)
+	if c != nil {
+		c.Close()
+		t.Fatal("Dial returned a non-nil Conn for an unwritable body")
+	}
+	if !errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrBadHandshake) {
+		t.Fatalf("Dial err = %v, want ErrInvalidArgument and not ErrBadHandshake", err)
+	}
+	if !strings.Contains(err.Error(), "not writable") {
+		t.Errorf("Dial err = %v, want it to mention %q", err, "not writable")
+	}
+}
+
+func TestDialRejectsMalformedURL(t *testing.T) {
+	// Caught before any network I/O, so this needs no server.
+	_, _, err := Dial(context.Background(), "ws://[::1", nil, nil)
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Dial err = %v, want ErrInvalidArgument", err)
 	}
 }

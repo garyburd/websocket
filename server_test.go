@@ -92,9 +92,11 @@ func TestUpgradeHijackFailureDoesNotCommitSwitchingProtocols(t *testing.T) {
 	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
 	w := httptest.NewRecorder()
 
+	// A ResponseWriter that cannot be hijacked is the server's fault, not the
+	// client's.
 	_, err := Upgrade(w, r, nil)
-	if !errors.Is(err, ErrBadHandshake) {
-		t.Fatalf("Upgrade err = %v, want ErrBadHandshake", err)
+	if !errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrBadHandshake) {
+		t.Fatalf("Upgrade err = %v, want ErrInvalidArgument and not ErrBadHandshake", err)
 	}
 	if w.Code == http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want a handshake failure status", w.Code)
@@ -183,11 +185,14 @@ func TestAllowedOriginsInvalidPatternPanics(t *testing.T) {
 }
 
 func TestUpgradeDefaultHostCheckRejectsOtherHost(t *testing.T) {
-	// With CheckOrigin == nil, Upgrade enforces the default host check.
+	// With CheckOrigin == nil, Upgrade enforces the default host check. A
+	// refused origin is the server's policy, not a protocol error, so the
+	// server's error does not match ErrBadHandshake; the client sees a 403,
+	// which does.
 	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, err := Upgrade(w, r, nil)
-		if !errors.Is(err, ErrBadHandshake) {
-			t.Errorf("Upgrade err = %v, want ErrBadHandshake", err)
+		if err == nil || errors.Is(err, ErrBadHandshake) {
+			t.Errorf("Upgrade err = %v, want a non-ErrBadHandshake error", err)
 		}
 	}))
 
@@ -210,21 +215,21 @@ func TestUpgradeDefaultHostCheckRejectsOtherHost(t *testing.T) {
 func TestUpgradeOnErrorRendersCustomResponse(t *testing.T) {
 	// OnError lets the caller render the rejection body, here a JSON
 	// payload (à la RFC 9457) instead of http.Error's plain text, while
-	// keeping the status Upgrade chose and the ErrBadHandshake error.
+	// keeping the status Upgrade chose and receiving the error Upgrade
+	// returns.
 	const body = `{"error":"forbidden origin"}`
 	srv, transport := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var onErr error
 		_, err := Upgrade(w, r, &UpgradeOptions{
 			OnError: func(w http.ResponseWriter, r *http.Request, status int, err error) {
-				if !errors.Is(err, ErrBadHandshake) {
-					t.Errorf("OnError err = %v, want ErrBadHandshake", err)
-				}
+				onErr = err
 				w.Header().Set("Content-Type", "application/problem+json")
 				w.WriteHeader(status)
 				io.WriteString(w, body)
 			},
 		})
-		if !errors.Is(err, ErrBadHandshake) {
-			t.Errorf("Upgrade err = %v, want ErrBadHandshake", err)
+		if err == nil || onErr != err {
+			t.Errorf("Upgrade err = %v, OnError err = %v; want the same non-nil error", err, onErr)
 		}
 	}))
 
@@ -321,6 +326,24 @@ func TestUpgradeResponseHeaderSpelling(t *testing.T) {
 	}
 }
 
+func TestUpgradeResponseWriteFailureIsNetworkError(t *testing.T) {
+	// A failed 101 write is a network error, not a protocol error in the
+	// client's handshake: the error wraps the cause and not ErrBadHandshake.
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("Sec-WebSocket-Version", "13")
+	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	server, client := net.Pipe()
+	client.Close()
+	w := &hijackRecorder{ResponseRecorder: httptest.NewRecorder(), conn: server}
+
+	_, err := Upgrade(w, r, nil)
+	if !errors.Is(err, io.ErrClosedPipe) || errors.Is(err, ErrBadHandshake) {
+		t.Fatalf("Upgrade err = %v, want io.ErrClosedPipe and not ErrBadHandshake", err)
+	}
+}
+
 func TestUpgradeRejectsNegativeOptions(t *testing.T) {
 	for name, opts := range map[string]*UpgradeOptions{
 		"ControlReplyTimeout": {ControlReplyTimeout: -1},
@@ -368,8 +391,8 @@ func TestUpgradeRejectsManagedResponseHeader(t *testing.T) {
 			_, err := Upgrade(w, r, &UpgradeOptions{
 				ResponseHeader: http.Header{key: {"x"}},
 			})
-			if !errors.Is(err, ErrBadHandshake) || !errors.Is(err, ErrInvalidArgument) {
-				t.Fatalf("Upgrade err = %v, want ErrBadHandshake and ErrInvalidArgument", err)
+			if !errors.Is(err, ErrInvalidArgument) || errors.Is(err, ErrBadHandshake) {
+				t.Fatalf("Upgrade err = %v, want ErrInvalidArgument and not ErrBadHandshake", err)
 			}
 			if w.Code != http.StatusInternalServerError {
 				t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
