@@ -3,6 +3,7 @@ package websocket
 import (
 	"bufio"
 	"fmt"
+	"iter"
 	"net/http"
 	"net/url"
 	"path"
@@ -74,6 +75,14 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 	var subprotocol string
 	if opts.SelectSubprotocol != nil {
 		subprotocol = opts.SelectSubprotocol(r)
+		// The client fails a handshake that selects a subprotocol it did not
+		// offer, and reports only that. Catch the selector's bug here, where
+		// the error can name both sides.
+		if subprotocol != "" && !slices.Contains(slices.Collect(offeredSubprotocols(r)), subprotocol) {
+			err := fmt.Errorf("websocket: SelectSubprotocol returned %q, which the client did not offer (offered %q)",
+				subprotocol, strings.Join(r.Header.Values("Sec-Websocket-Protocol"), ", "))
+			return reject(http.StatusInternalServerError, err, http.StatusText(http.StatusInternalServerError))
+		}
 	}
 
 	h := make(http.Header)
@@ -140,14 +149,26 @@ func writeSwitchingProtocols(w *bufio.Writer, h http.Header) error {
 func SupportedSubprotocols(supported ...string) func(*http.Request) string {
 	supported = slices.Clone(supported)
 	return func(r *http.Request) string {
-		for _, hdr := range r.Header.Values("Sec-Websocket-Protocol") {
-			for c := range strings.SplitSeq(hdr, ",") {
-				if c = trimOWS(c); slices.Contains(supported, c) {
-					return c
-				}
+		for c := range offeredSubprotocols(r) {
+			if slices.Contains(supported, c) {
+				return c
 			}
 		}
 		return ""
+	}
+}
+
+// offeredSubprotocols yields the client's Sec-WebSocket-Protocol values in
+// order.
+func offeredSubprotocols(r *http.Request) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for _, hdr := range r.Header.Values("Sec-Websocket-Protocol") {
+			for c := range strings.SplitSeq(hdr, ",") {
+				if !yield(trimOWS(c)) {
+					return
+				}
+			}
+		}
 	}
 }
 

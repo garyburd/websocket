@@ -344,6 +344,34 @@ func TestUpgradeResponseWriteFailureIsNetworkError(t *testing.T) {
 	}
 }
 
+func TestUpgradeRejectsUnofferedSubprotocol(t *testing.T) {
+	// A selector that returns a value the client did not offer is a server
+	// bug. The client would only report that the handshake failed, so
+	// Upgrade responds 500 and names both the selection and the offer.
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("Sec-WebSocket-Version", "13")
+	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	r.Header.Set("Sec-WebSocket-Protocol", "chat, superchat")
+	w := httptest.NewRecorder()
+
+	_, err := Upgrade(w, r, &UpgradeOptions{
+		SelectSubprotocol: func(*http.Request) string { return "other" },
+	})
+	if err == nil || errors.Is(err, ErrBadHandshake) {
+		t.Fatalf("Upgrade err = %v, want a non-ErrBadHandshake error", err)
+	}
+	for _, want := range []string{`"other"`, `"chat, superchat"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Upgrade err = %v, want it to mention %s", err, want)
+		}
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
 func TestUpgradeRejectsNegativeOptions(t *testing.T) {
 	for name, opts := range map[string]*UpgradeOptions{
 		"ControlReplyTimeout": {ControlReplyTimeout: -1},

@@ -57,7 +57,8 @@ type DialOptions struct {
 // Upgrade reads the options only during the call.
 type UpgradeOptions struct {
 	// SelectSubprotocol selects a value offered in Sec-WebSocket-Protocol.
-	// Return "" for none. See [SupportedSubprotocols].
+	// Return "" for none. Upgrade fails if it returns a value the client did
+	// not offer. See [SupportedSubprotocols].
 	SelectSubprotocol func(*http.Request) string
 
 	// CheckOrigin approves the Origin header. If nil, Upgrade accepts an absent
