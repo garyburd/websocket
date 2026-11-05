@@ -74,6 +74,9 @@ func Dial(ctx context.Context, rawURL string, opts *DialOptions, header http.Hea
 		req.Header.Set("Sec-Websocket-Protocol", strings.Join(opts.Subprotocols, ", "))
 	}
 
+	// TODO: consider calling useRFCHeaderKeys(req.Header) here for servers that
+	// match header names case-sensitively. The cost: a RoundTripper that reads
+	// these headers with http.Header methods would no longer find them.
 	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		return nil, nil, http2Hint(rt, fmt.Errorf("websocket: handshake: %w", err))

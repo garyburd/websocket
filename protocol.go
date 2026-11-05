@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -49,6 +50,29 @@ func tokenListHas(values []string, token string) bool {
 		}
 	}
 	return false
+}
+
+// rfcHeaderKeys maps the canonical form of each header name registered by
+// RFC 6455 §11.3 to the RFC's spelling.
+var rfcHeaderKeys = map[string]string{
+	"Sec-Websocket-Key":        "Sec-WebSocket-Key",
+	"Sec-Websocket-Extensions": "Sec-WebSocket-Extensions",
+	"Sec-Websocket-Accept":     "Sec-WebSocket-Accept",
+	"Sec-Websocket-Protocol":   "Sec-WebSocket-Protocol",
+	"Sec-Websocket-Version":    "Sec-WebSocket-Version",
+}
+
+// useRFCHeaderKeys renames h's canonical keys for the RFC 6455 headers
+// (Sec-Websocket-*) to the RFC's spelling (Sec-WebSocket-*), because some peers
+// match header names case-sensitively. Call it just before h is written:
+// [http.Header] methods do not find the renamed keys.
+func useRFCHeaderKeys(h http.Header) {
+	for canonical, rfc := range rfcHeaderKeys {
+		if v, ok := h[canonical]; ok {
+			delete(h, canonical)
+			h[rfc] = v
+		}
+	}
 }
 
 // isToken reports whether s is a nonempty HTTP token.

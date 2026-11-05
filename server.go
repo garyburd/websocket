@@ -102,7 +102,9 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 	return c, nil
 }
 
+// writeSwitchingProtocols writes the 101 response. It modifies h.
 func writeSwitchingProtocols(w *bufio.Writer, h http.Header) error {
+	useRFCHeaderKeys(h)
 	// bufio.Writer retains the first error until Flush.
 	w.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	h.Write(w)

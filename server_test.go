@@ -227,6 +227,69 @@ func TestUpgradeOnErrorRendersCustomResponse(t *testing.T) {
 	}
 }
 
+func TestUpgradeResponseHeaderSpelling(t *testing.T) {
+	// Some clients match header names case-sensitively, so the 101 response
+	// uses the RFC 6455 spelling Sec-WebSocket-*, not the canonical
+	// Sec-Websocket-*. A Sec-WebSocket-Protocol in ResponseHeader is replaced
+	// by the selected subprotocol, not sent twice.
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("Sec-WebSocket-Version", "13")
+	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	r.Header.Set("Sec-WebSocket-Protocol", "chat")
+	server, client := net.Pipe()
+	defer client.Close()
+	w := &hijackRecorder{ResponseRecorder: httptest.NewRecorder(), conn: server}
+
+	type result struct {
+		head string
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		br := bufio.NewReader(client)
+		var b strings.Builder
+		for {
+			line, err := br.ReadString('\n')
+			b.WriteString(line)
+			if err != nil || line == "\r\n" {
+				got <- result{b.String(), err}
+				return
+			}
+		}
+	}()
+
+	c, err := Upgrade(w, r, &UpgradeOptions{
+		SelectSubprotocol: SupportedSubprotocols("chat"),
+		ResponseHeader:    http.Header{"Sec-Websocket-Protocol": {"other"}},
+	})
+	if err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	defer c.Close()
+	res := <-got
+	if res.err != nil {
+		t.Fatalf("read response: %v", res.err)
+	}
+	for _, want := range []string{
+		"\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n",
+		"\r\nSec-WebSocket-Protocol: chat\r\n",
+	} {
+		if !strings.Contains(res.head, want) {
+			t.Errorf("response missing %q:\n%s", want, res.head)
+		}
+	}
+	if n := strings.Count(strings.ToLower(res.head), "sec-websocket-protocol:"); n != 1 {
+		t.Errorf("Sec-WebSocket-Protocol sent %d times, want 1:\n%s", n, res.head)
+	}
+	for _, bad := range []string{"Sec-Websocket-Accept:", "Sec-Websocket-Protocol:"} {
+		if strings.Contains(res.head, bad) {
+			t.Errorf("response uses canonical spelling %q:\n%s", bad, res.head)
+		}
+	}
+}
+
 // hijackRecorder is a ResponseRecorder whose Hijack returns conn.
 type hijackRecorder struct {
 	*httptest.ResponseRecorder
