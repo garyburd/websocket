@@ -19,25 +19,23 @@ func newTestServer(t testing.TB, handler http.Handler) (*httptest.Server, *http.
 	return srv, srv.Client().Transport.(*http.Transport)
 }
 
-func TestDialRejectsSecWebSocketHeader(t *testing.T) {
-	// Sec-WebSocket-* headers carry handshake semantics Dial owns;
-	// supplying one is a caller error caught before any network I/O,
-	// so this needs no server.
+func TestDialRejectsManagedHeader(t *testing.T) {
+	// Upgrade, Connection, and Sec-WebSocket-* headers carry handshake
+	// semantics Dial owns; supplying one is a caller error caught before any
+	// network I/O, so this needs no server. Keys are matched
+	// case-insensitively, since callers can assign the map directly.
 	for _, key := range []string{
+		"Upgrade",
+		"connection",
 		"Sec-WebSocket-Key",
-		"Sec-WebSocket-Version",
-		"Sec-WebSocket-Protocol",
+		"Sec-Websocket-Version",
+		"sec-websocket-protocol",
 		"Sec-WebSocket-Extensions",
 	} {
-		h := http.Header{}
-		h.Set(key, "x")
+		h := http.Header{key: {"x"}}
 		_, _, err := Dial(context.Background(), "ws://example.invalid/", nil, h)
-		if err == nil {
-			t.Errorf("Dial with header %q = nil error, want rejection", key)
-			continue
-		}
-		if !strings.Contains(err.Error(), "Sec-WebSocket") {
-			t.Errorf("Dial with header %q error = %v, want it to mention Sec-WebSocket", key, err)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("Dial with header %q error = %v, want ErrInvalidArgument", key, err)
 		}
 	}
 }
@@ -50,8 +48,8 @@ func TestDialRejectsInvalidSubprotocol(t *testing.T) {
 	for _, proto := range []string{"", "chat,superchat", "chat v2", "chat;v2", "café"} {
 		opts := &DialOptions{Subprotocols: []string{proto}}
 		_, _, err := Dial(context.Background(), "ws://example.invalid/", opts, nil)
-		if err == nil || !strings.Contains(err.Error(), "subprotocol") {
-			t.Errorf("Dial with subprotocol %q err = %v, want subprotocol rejection", proto, err)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("Dial with subprotocol %q err = %v, want ErrInvalidArgument", proto, err)
 		}
 	}
 }

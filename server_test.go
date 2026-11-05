@@ -227,11 +227,10 @@ func TestUpgradeOnErrorRendersCustomResponse(t *testing.T) {
 	}
 }
 
-func TestUpgradeResponseHeaderSpelling(t *testing.T) {
-	// Some clients match header names case-sensitively, so the 101 response
-	// uses the RFC 6455 spelling Sec-WebSocket-*, not the canonical
-	// Sec-Websocket-*. A Sec-WebSocket-Protocol in ResponseHeader is replaced
-	// by the selected subprotocol, not sent twice.
+// upgradeResponseHead runs Upgrade on a valid request that offers the "chat"
+// subprotocol and returns the raw 101 status line and headers.
+func upgradeResponseHead(t *testing.T, opts *UpgradeOptions) string {
+	t.Helper()
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.Header.Set("Connection", "Upgrade")
 	r.Header.Set("Upgrade", "websocket")
@@ -239,7 +238,7 @@ func TestUpgradeResponseHeaderSpelling(t *testing.T) {
 	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
 	r.Header.Set("Sec-WebSocket-Protocol", "chat")
 	server, client := net.Pipe()
-	defer client.Close()
+	t.Cleanup(func() { client.Close() })
 	w := &hijackRecorder{ResponseRecorder: httptest.NewRecorder(), conn: server}
 
 	type result struct {
@@ -260,33 +259,68 @@ func TestUpgradeResponseHeaderSpelling(t *testing.T) {
 		}
 	}()
 
-	c, err := Upgrade(w, r, &UpgradeOptions{
-		SelectSubprotocol: SupportedSubprotocols("chat"),
-		ResponseHeader:    http.Header{"Sec-Websocket-Protocol": {"other"}},
-	})
+	c, err := Upgrade(w, r, opts)
 	if err != nil {
 		t.Fatalf("Upgrade: %v", err)
 	}
-	defer c.Close()
+	t.Cleanup(func() { c.Close() })
 	res := <-got
 	if res.err != nil {
 		t.Fatalf("read response: %v", res.err)
 	}
+	return res.head
+}
+
+func TestUpgradeResponseHeaderSpelling(t *testing.T) {
+	// Some clients match header names case-sensitively, so the 101 response
+	// uses the RFC 6455 spelling Sec-WebSocket-*, not the canonical
+	// Sec-Websocket-*.
+	head := upgradeResponseHead(t, &UpgradeOptions{
+		SelectSubprotocol: SupportedSubprotocols("chat"),
+	})
 	for _, want := range []string{
 		"\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n",
 		"\r\nSec-WebSocket-Protocol: chat\r\n",
 	} {
-		if !strings.Contains(res.head, want) {
-			t.Errorf("response missing %q:\n%s", want, res.head)
+		if !strings.Contains(head, want) {
+			t.Errorf("response missing %q:\n%s", want, head)
 		}
-	}
-	if n := strings.Count(strings.ToLower(res.head), "sec-websocket-protocol:"); n != 1 {
-		t.Errorf("Sec-WebSocket-Protocol sent %d times, want 1:\n%s", n, res.head)
 	}
 	for _, bad := range []string{"Sec-Websocket-Accept:", "Sec-Websocket-Protocol:"} {
-		if strings.Contains(res.head, bad) {
-			t.Errorf("response uses canonical spelling %q:\n%s", bad, res.head)
+		if strings.Contains(head, bad) {
+			t.Errorf("response uses canonical spelling %q:\n%s", bad, head)
 		}
+	}
+}
+
+func TestUpgradeRejectsManagedResponseHeader(t *testing.T) {
+	// ResponseHeader must not set a header Upgrade manages. Keys are matched
+	// case-insensitively, since callers can assign the map directly.
+	for _, key := range []string{
+		"Upgrade",
+		"connection",
+		"Sec-WebSocket-Accept",
+		"Sec-Websocket-Protocol",
+		"sec-websocket-extensions",
+	} {
+		t.Run(key, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.Header.Set("Connection", "Upgrade")
+			r.Header.Set("Upgrade", "websocket")
+			r.Header.Set("Sec-WebSocket-Version", "13")
+			r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+			w := httptest.NewRecorder()
+
+			_, err := Upgrade(w, r, &UpgradeOptions{
+				ResponseHeader: http.Header{key: {"x"}},
+			})
+			if !errors.Is(err, ErrBadHandshake) || !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("Upgrade err = %v, want ErrBadHandshake and ErrInvalidArgument", err)
+			}
+			if w.Code != http.StatusInternalServerError {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+			}
+		})
 	}
 }
 

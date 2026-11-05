@@ -66,8 +66,10 @@ type UpgradeOptions struct {
 	// invites cross-site WebSocket hijacking.
 	CheckOrigin func(*http.Request) bool
 
-	// ResponseHeader adds headers to the 101 response. Upgrade overwrites its
-	// protocol-managed headers.
+	// ResponseHeader adds headers to the 101 response. It must not set
+	// Upgrade, Connection, or Sec-WebSocket-* headers, which Upgrade manages;
+	// if it does, Upgrade responds with 500 Internal Server Error and returns
+	// an error that wraps both [ErrBadHandshake] and [ErrInvalidArgument].
 	ResponseHeader http.Header
 
 	// OnError writes a rejected handshake response. err wraps

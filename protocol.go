@@ -52,6 +52,14 @@ func tokenListHas(values []string, token string) bool {
 	return false
 }
 
+// isManagedHeader reports whether key names a header that Dial and Upgrade
+// set themselves: Upgrade, Connection, or a Sec-WebSocket-* header. key may
+// be in any case.
+func isManagedHeader(key string) bool {
+	return strings.EqualFold(key, "Upgrade") || strings.EqualFold(key, "Connection") ||
+		strings.HasPrefix(strings.ToLower(key), "sec-websocket")
+}
+
 // rfcHeaderKeys maps the canonical form of each header name registered by
 // RFC 6455 §11.3 to the RFC's spelling.
 var rfcHeaderKeys = map[string]string{

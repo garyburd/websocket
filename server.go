@@ -20,14 +20,27 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 		opts = &UpgradeOptions{}
 	}
 
-	fail := func(status int, reason string) (*Conn, error) {
-		err := fmt.Errorf("%w: %s", ErrBadHandshake, reason)
+	reject := func(status int, err error, body string) (*Conn, error) {
 		if opts.OnError != nil {
 			opts.OnError(w, r, status, err)
 		} else {
-			http.Error(w, reason, status)
+			http.Error(w, body, status)
 		}
 		return nil, err
+	}
+	fail := func(status int, reason string) (*Conn, error) {
+		return reject(status, fmt.Errorf("%w: %s", ErrBadHandshake, reason), reason)
+	}
+
+	// Check the options before the request so a misconfigured server rejects
+	// every handshake, not only those that pass request validation. The
+	// client gets a generic body: the fault is in the server's configuration.
+	for k := range opts.ResponseHeader {
+		if isManagedHeader(k) {
+			err := fmt.Errorf("%w: %w: ResponseHeader must not set %q, which Upgrade manages",
+				ErrBadHandshake, ErrInvalidArgument, k)
+			return reject(http.StatusInternalServerError, err, http.StatusText(http.StatusInternalServerError))
+		}
 	}
 
 	if r.Method != http.MethodGet {

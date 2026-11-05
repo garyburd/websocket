@@ -14,8 +14,10 @@ import (
 // Dial opens a WebSocket connection. header may contain application headers
 // such as Origin, Cookie, and Authorization.
 //
-// Dial rejects Sec-WebSocket-* headers, which it manages. Configure
-// subprotocols through [DialOptions.Subprotocols].
+// header must not set Upgrade, Connection, or Sec-WebSocket-* headers, which
+// Dial manages; if it does, Dial returns an error that wraps
+// [ErrInvalidArgument]. Configure subprotocols through
+// [DialOptions.Subprotocols].
 //
 // ctx bounds only the handshake. Use [Conn.Shutdown], [Conn.Close],
 // [ReadOptions], and [WriteOptions] after Dial returns.
@@ -30,13 +32,13 @@ func Dial(ctx context.Context, rawURL string, opts *DialOptions, header http.Hea
 		opts = &DialOptions{}
 	}
 	for k := range header {
-		if strings.HasPrefix(strings.ToLower(k), "sec-websocket") {
-			return nil, nil, fmt.Errorf("websocket: header must not set %q; Sec-WebSocket-* headers are managed by Dial", k)
+		if isManagedHeader(k) {
+			return nil, nil, fmt.Errorf("%w: header must not set %q, which Dial manages", ErrInvalidArgument, k)
 		}
 	}
 	for _, p := range opts.Subprotocols {
 		if !isToken(p) {
-			return nil, nil, fmt.Errorf("websocket: subprotocol %q is not a valid token", p)
+			return nil, nil, fmt.Errorf("%w: subprotocol %q is not a valid token", ErrInvalidArgument, p)
 		}
 	}
 	rt := opts.Transport
