@@ -13,8 +13,13 @@ import (
 // Upgrade accepts a WebSocket handshake and takes ownership of the underlying
 // HTTP/1.x connection.
 //
-// On failure, Upgrade writes an HTTP error and returns [ErrBadHandshake]. On
-// success, the returned [Conn] owns w; the handler must not use w again.
+// If the client's handshake has a protocol error, Upgrade writes an HTTP error
+// response and returns an error that wraps [ErrBadHandshake]. On success, the
+// returned [Conn] owns the connection. Either way, the handler must not use w
+// after Upgrade returns.
+//
+// A handler that serves both WebSocket and ordinary HTTP requests can use
+// [IsUpgradeRequest] to decide whether to call Upgrade.
 func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Conn, error) {
 	if opts == nil {
 		opts = &UpgradeOptions{}
@@ -46,11 +51,8 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 	if r.Method != http.MethodGet {
 		return fail(http.StatusMethodNotAllowed, fmt.Sprintf("method %q not allowed", r.Method))
 	}
-	if !tokenListHas(r.Header.Values("Connection"), "upgrade") {
-		return fail(http.StatusBadRequest, "missing Connection: upgrade")
-	}
-	if !tokenListHas(r.Header.Values("Upgrade"), "websocket") {
-		return fail(http.StatusBadRequest, "missing Upgrade: websocket")
+	if !IsUpgradeRequest(r) {
+		return fail(http.StatusBadRequest, "not a WebSocket upgrade request (requires Connection: upgrade and Upgrade: websocket)")
 	}
 	if r.Header.Get("Sec-Websocket-Version") != "13" {
 		// RFC 6455 §4.2.2 requires the supported version in the rejection.
@@ -113,6 +115,16 @@ func Upgrade(w http.ResponseWriter, r *http.Request, opts *UpgradeOptions) (*Con
 	})
 	c.subprotocol = subprotocol
 	return c, nil
+}
+
+// IsUpgradeRequest reports whether r asks to switch to the WebSocket protocol:
+// its Connection header includes the token "upgrade" and its Upgrade header
+// includes the token "websocket", ignoring case. It does not validate the
+// rest of the handshake. If it reports true, pass r to [Upgrade], which
+// responds to a malformed request with the error the client expects.
+func IsUpgradeRequest(r *http.Request) bool {
+	return tokenListHas(r.Header.Values("Connection"), "upgrade") &&
+		tokenListHas(r.Header.Values("Upgrade"), "websocket")
 }
 
 // writeSwitchingProtocols writes the 101 response. It modifies h.

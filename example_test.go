@@ -6,6 +6,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,51 @@ func Example_echo() {
 	fmt.Printf("%s\n", data)
 
 	// Output: hello
+}
+
+// One handler serves both an ordinary page and a WebSocket endpoint at the same
+// path. [websocket.IsUpgradeRequest] chooses between them; Upgrade then
+// validates the rest of the handshake.
+func ExampleIsUpgradeRequest() {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsUpgradeRequest(r) {
+			fmt.Fprint(w, "page")
+			return
+		}
+		c, err := websocket.Upgrade(w, r, nil)
+		if err != nil {
+			return // Upgrade has already responded or closed the connection
+		}
+		defer c.Close()
+		c.WriteMessage(context.Background(), websocket.MessageText, nil, []byte("socket"))
+	}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		fmt.Println("get:", err)
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	fmt.Printf("%s\n", body)
+
+	c, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http"), nil, nil)
+	if err != nil {
+		fmt.Println("dial:", err)
+		return
+	}
+	defer c.Close()
+	data, _, err := c.ReadMessage(nil)
+	if err != nil {
+		fmt.Println("read:", err)
+		return
+	}
+	fmt.Printf("%s\n", data)
+
+	// Output:
+	// page
+	// socket
 }
 
 // A read loop ends on the first error. Use errors.As to recover the peer's close

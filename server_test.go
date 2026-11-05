@@ -56,6 +56,34 @@ func TestUpgradeRejectsBadHandshake(t *testing.T) {
 	}
 }
 
+func TestIsUpgradeRequest(t *testing.T) {
+	cases := []struct {
+		name       string
+		connection []string
+		upgrade    []string
+		want       bool
+	}{
+		{"Plain", []string{"Upgrade"}, []string{"websocket"}, true},
+		{"TokenList", []string{"keep-alive, Upgrade"}, []string{"websocket"}, true},
+		{"Case", []string{"UPGRADE"}, []string{"WebSocket"}, true},
+		{"RepeatedHeader", []string{"keep-alive", "upgrade"}, []string{"h2c", "websocket"}, true},
+		{"NoConnection", nil, []string{"websocket"}, false},
+		{"NoUpgrade", []string{"Upgrade"}, nil, false},
+		{"OtherProtocol", []string{"Upgrade"}, []string{"h2c"}, false},
+		{"Neither", nil, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.Header["Connection"] = tc.connection
+			r.Header["Upgrade"] = tc.upgrade
+			if got := IsUpgradeRequest(r); got != tc.want {
+				t.Errorf("IsUpgradeRequest = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestUpgradeHijackFailureDoesNotCommitSwitchingProtocols(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.Header.Set("Connection", "Upgrade")
