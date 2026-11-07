@@ -582,6 +582,15 @@ type reader struct {
 	// frame buffer, and a close reason is copied into a string.
 	control [maxControlPayload]byte
 
+	// readers is a ring of message handles, and next indexes the slot for
+	// the next message. A pointer into the connection avoids allocating a
+	// Reader per message. Closing a message clears its slot, so a handle
+	// used after its callback returns an error. A retained handle goes
+	// undetected only while its slot serves a later message, len(readers)
+	// messages on. Guarded by mu.
+	readers [8]Reader
+	next    int
+
 	// Sticky across messages; guarded by mu.
 	terminalErr error
 }
@@ -599,6 +608,15 @@ type writer struct {
 	deadline       time.Time
 	rate           int
 	messageTimeout time.Duration
+
+	// writers is a ring of message handles, and next indexes the slot for
+	// the next message. A pointer into the connection avoids allocating a
+	// Writer per message. Closing a message clears its slot, so a handle
+	// used after its callback returns an error. A retained handle goes
+	// undetected only while its slot serves a later message, len(writers)
+	// messages on. Guarded by mu.
+	writers [8]Writer
+	next    int
 }
 
 // frame serializes outbound frames.
@@ -744,7 +762,10 @@ func (c *Conn) nextReader(opts *ReadOptions) (*Reader, error) {
 	if c.bodyBuffered() {
 		c.monitor.endBody()
 	}
-	return &Reader{c: c}, nil
+	r := &c.reader.readers[c.reader.next]
+	c.reader.next = (c.reader.next + 1) % len(c.reader.readers)
+	r.c = c
+	return r, nil
 }
 
 // readFragment consumes controls and installs the next data fragment.
@@ -1112,7 +1133,10 @@ func (c *Conn) nextWriter(ctx context.Context, mt MessageType, opts *WriteOption
 	default:
 		c.writer.deadline = time.Time{}
 	}
-	return &Writer{c: c}, nil
+	w := &c.writer.writers[c.writer.next]
+	c.writer.next = (c.writer.next + 1) % len(c.writer.writers)
+	w.c = c
+	return w, nil
 }
 
 var (

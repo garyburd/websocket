@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"slices"
 	"strings"
@@ -1730,6 +1732,53 @@ func TestRetainedHandlesRejected(t *testing.T) {
 	}
 }
 
+// TestRetainedHandlesRejectedDuringLaterMessages checks that a handle kept
+// from one message is rejected while each of the next len(readers)-1
+// messages is in progress: the ring does not hand its slot to them.
+func TestRetainedHandlesRejectedDuringLaterMessages(t *testing.T) {
+	c := newTestConn(t, &loopRWC{data: messageStream(false, opText, []byte("hi"), 1, false)})
+	ctx := context.Background()
+
+	var staleR *Reader
+	if err := c.Read(nil, func(r *Reader) error { staleR = r; return nil }); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	var staleW *Writer
+	if err := c.Write(ctx, MessageText, nil, func(w *Writer) error { staleW = w; return nil }); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if len(c.reader.readers) != len(c.writer.writers) {
+		t.Fatalf("ring sizes differ: %d readers, %d writers", len(c.reader.readers), len(c.writer.writers))
+	}
+	for i := 1; i < len(c.reader.readers); i++ {
+		err := c.Read(nil, func(r *Reader) error {
+			if r == staleR {
+				t.Errorf("message %d: got the retained Reader's slot", i)
+			}
+			if _, err := staleR.Read(make([]byte, 1)); !errors.Is(err, ErrInvalidArgument) {
+				t.Errorf("message %d: retained Reader.Read = %v, want ErrInvalidArgument", i, err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("message %d: Read: %v", i, err)
+		}
+		err = c.Write(ctx, MessageText, nil, func(w *Writer) error {
+			if w == staleW {
+				t.Errorf("message %d: got the retained Writer's slot", i)
+			}
+			if _, err := staleW.Write([]byte("x")); !errors.Is(err, ErrInvalidArgument) {
+				t.Errorf("message %d: retained Writer.Write = %v, want ErrInvalidArgument", i, err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("message %d: Write: %v", i, err)
+		}
+	}
+}
+
 func TestWriterWriteAfterCloseReturnsScopeError(t *testing.T) {
 	c, peer := connPair(t)
 
@@ -2563,5 +2612,296 @@ func TestInvalidUTF8RejectedBeforeFrameCompletes(t *testing.T) {
 				t.Errorf("read err = %v, want ErrProtocol", err)
 			}
 		})
+	}
+}
+
+// raceEnabled reports whether the test binary was built with -race. The race
+// detector makes sync.Pool drop one item in four on Put, so code that borrows
+// a pooled buffer allocates.
+func raceEnabled() bool {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "-race" {
+			return s.Value == "true"
+		}
+	}
+	return false
+}
+
+// checkNoAllocs fails t if f allocates on average once per 100 calls or
+// more, measured over 1000 calls after a warm-up. testing.AllocsPerRun rounds
+// the average down to an integer, which hides an allocation that happens on
+// only some calls; counting exactly catches it. The count is process-wide, so
+// goroutines left behind by earlier tests can inflate it; such noise is
+// sporadic while an allocation in f repeats, so the check fails only if three
+// measurements in a row are over the limit.
+func checkNoAllocs(t *testing.T, what string, f func()) {
+	t.Helper()
+	const n = 1000
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	for range 3 {
+		f() // warm up pools and buffers
+	}
+	var allocs uint64
+	for range 3 {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for range n {
+			f()
+		}
+		runtime.ReadMemStats(&after)
+		allocs = after.Mallocs - before.Mallocs
+		if allocs*100 < n {
+			return
+		}
+	}
+	t.Errorf("%s allocates %d times in %d messages, want fewer than %d", what, allocs, n, n/100)
+}
+
+// loopRWC serves data cyclically to reads and discards writes, so a
+// connection over it can read the same messages forever without allocating
+// in the transport.
+type loopRWC struct {
+	data []byte
+	off  int
+}
+
+func (l *loopRWC) Read(p []byte) (int, error) {
+	n := copy(p, l.data[l.off:])
+	l.off = (l.off + n) % len(l.data)
+	return n, nil
+}
+
+func (l *loopRWC) Write(p []byte) (int, error) { return len(p), nil }
+func (l *loopRWC) Close() error                { return nil }
+
+// appendFrame appends one frame as the peer of a connection with the given
+// role would send it: masked when the connection is a server.
+func appendFrame(dst []byte, isServer bool, fin bool, op int, payload []byte) []byte {
+	var hdr [maxHeaderLen]byte
+	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
+	n := buildHeader(hdr[:], !isServer, op, fin, len(payload), key)
+	dst = append(dst, hdr[:n]...)
+	start := len(dst)
+	dst = append(dst, payload...)
+	if isServer {
+		maskCopy(dst[start:], dst[start:], key, 0)
+	}
+	return dst
+}
+
+// messageStream returns the wire bytes of one message split into fragments
+// frames of equal size (the last takes the remainder), with a ping before the
+// last frame when ping is set.
+func messageStream(isServer bool, op int, payload []byte, fragments int, ping bool) []byte {
+	var out []byte
+	size := len(payload) / fragments
+	for i := 0; i < fragments; i++ {
+		last := i == fragments-1
+		if last && ping {
+			out = appendFrame(out, isServer, true, opPing, []byte("ping"))
+		}
+		chunk := payload[i*size : (i+1)*size]
+		if last {
+			chunk = payload[i*size:]
+		}
+		frameOp := opContinuation
+		if i == 0 {
+			frameOp = op
+		}
+		out = appendFrame(out, isServer, last, frameOp, chunk)
+	}
+	return out
+}
+
+// TestConnReadDoesNotAllocate checks that reading a message with Conn.Read
+// allocates nothing in steady state, for both roles, text and binary,
+// fragmented messages, interleaved control frames, and each kind of
+// ReadOptions. Each message is read to the end by the callback, and, with nil
+// options, also left unread for the connection to discard. Text messages skip
+// UTF-8 validation.
+func TestConnReadDoesNotAllocate(t *testing.T) {
+	small := []byte(strings.Repeat("hello, world ", 8)) // 104 bytes
+	large := bytes.Repeat([]byte("0123456789abcdef"), 100<<10/16)
+
+	optCases := []struct {
+		name string
+		opts *ReadOptions
+	}{
+		{"NilOptions", nil},
+		{"Keepalive", &ReadOptions{IdleTimeout: time.Hour, KeepaliveInterval: time.Minute, KeepaliveTimeout: time.Minute}},
+		{"MessageTimeout", &ReadOptions{MessageTimeout: time.Hour}},
+		{"MinReadRate", &ReadOptions{MinReadRate: 1}},
+	}
+	msgCases := []struct {
+		name      string
+		op        int
+		payload   []byte
+		fragments int
+		ping      bool
+	}{
+		{"SmallText", opText, small, 1, false},
+		{"SmallBinary", opBinary, small, 1, false},
+		{"LargeBinary", opBinary, large, 1, false},
+		{"FragmentedText", opText, large, 3, false},
+		{"PingMidMessage", opBinary, small, 2, true},
+	}
+
+	for _, isServer := range []bool{false, true} {
+		role := "Client"
+		if isServer {
+			role = "Server"
+		}
+		for _, mc := range msgCases {
+			for _, readAll := range []bool{true, false} {
+				consume := "ReadAll"
+				if !readAll {
+					consume = "Unread"
+				}
+				for _, oc := range optCases {
+					if !readAll && oc.opts != nil {
+						continue // one options case is enough for the discard path
+					}
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", role, mc.name, consume, oc.name), func(t *testing.T) {
+						if !readAll && raceEnabled() {
+							t.Skip("the race detector makes sync.Pool drop the buffer that discarding a message borrows")
+						}
+						rwc := &loopRWC{data: messageStream(isServer, mc.op, mc.payload, mc.fragments, mc.ping)}
+						var cfg []func(*connConfig)
+						if isServer {
+							cfg = append(cfg, withServer())
+						}
+						c := newTestConn(t, rwc, cfg...)
+
+						opts := oc.opts
+						if mc.op == opText {
+							// Validation is byte at a time and allocation free;
+							// skip it to keep the large text case fast.
+							o := ReadOptions{}
+							if opts != nil {
+								o = *opts
+							}
+							o.SkipUTF8Validation = true
+							opts = &o
+						}
+
+						buf := make([]byte, 4096)
+						var got int
+						fn := func(r *Reader) error {
+							got = 0
+							if !readAll {
+								return nil // Conn.Read discards the message
+							}
+							for {
+								n, err := r.Read(buf)
+								got += n
+								if err == io.EOF {
+									return nil
+								}
+								if err != nil {
+									return err
+								}
+							}
+						}
+						checkNoAllocs(t, "Conn.Read", func() {
+							if err := c.Read(opts, fn); err != nil {
+								t.Fatalf("Read: %v", err)
+							}
+							if readAll && got != len(mc.payload) {
+								t.Fatalf("read %d bytes, want %d", got, len(mc.payload))
+							}
+						})
+					})
+				}
+			}
+		}
+	}
+}
+
+// TestConnWriteDoesNotAllocate checks that writing a message with Conn.Write
+// allocates nothing in steady state, for both roles (the client masks), text
+// and binary, messages that fit the write buffer, a single write larger than
+// it, several writes that fragment the message, Writer.WriteString, and each
+// kind of WriteOptions.
+func TestConnWriteDoesNotAllocate(t *testing.T) {
+	if raceEnabled() {
+		t.Skip("the race detector makes sync.Pool drop the write buffer that each message borrows")
+	}
+	small := []byte(strings.Repeat("hello, world ", 8)) // 104 bytes
+	large := bytes.Repeat([]byte("0123456789abcdef"), 100<<10/16)
+	chunk := large[:40<<10]
+
+	optCases := []struct {
+		name string
+		opts *WriteOptions
+	}{
+		{"NilOptions", nil},
+		{"MessageTimeout", &WriteOptions{MessageTimeout: time.Hour}},
+		{"MinWriteRate", &WriteOptions{MinWriteRate: 1}},
+	}
+	smallString := string(small)
+	msgCases := []struct {
+		name string
+		mt   MessageType
+		fn   func(w *Writer) error
+	}{
+		{"SmallText", MessageText, func(w *Writer) error {
+			_, err := w.Write(small)
+			return err
+		}},
+		{"SmallBinary", MessageBinary, func(w *Writer) error {
+			_, err := w.Write(small)
+			return err
+		}},
+		{"LargeBinary", MessageBinary, func(w *Writer) error {
+			_, err := w.Write(large)
+			return err
+		}},
+		{"Fragmented", MessageBinary, func(w *Writer) error {
+			for range 3 {
+				if _, err := w.Write(chunk); err != nil {
+					return err
+				}
+			}
+			return nil
+		}},
+		{"FinalThenWrite", MessageBinary, func(w *Writer) error {
+			w.Final()
+			_, err := w.Write(small)
+			return err
+		}},
+		{"WriteString", MessageText, func(w *Writer) error {
+			_, err := w.WriteString(smallString)
+			return err
+		}},
+	}
+
+	ctx := context.Background()
+	for _, isServer := range []bool{false, true} {
+		role := "Client"
+		if isServer {
+			role = "Server"
+		}
+		for _, mc := range msgCases {
+			for _, oc := range optCases {
+				t.Run(fmt.Sprintf("%s/%s/%s", role, mc.name, oc.name), func(t *testing.T) {
+					rwc := &loopRWC{data: []byte{0}}
+					var cfg []func(*connConfig)
+					if isServer {
+						cfg = append(cfg, withServer())
+					}
+					c := newTestConn(t, rwc, cfg...)
+
+					checkNoAllocs(t, "Conn.Write", func() {
+						if err := c.Write(ctx, mc.mt, oc.opts, mc.fn); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+					})
+				})
+			}
+		}
 	}
 }
