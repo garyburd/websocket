@@ -948,11 +948,12 @@ func FuzzMaskCopy(f *testing.F) {
 	})
 }
 
-// FuzzUTF8Validate fuzzes the UTF-8 DFA directly against the stdlib oracle:
-// whole-buffer validity must match utf8.Valid, and feeding the bytes in two
+// FuzzUTF8Validate fuzzes the streaming UTF-8 check against utf8.Valid:
+// whole-buffer and prefix validity must match it, and feeding the bytes in two
 // pieces (split at every offset) must reach the same final state as feeding
 // them whole, the carry-across-chunks property the streaming read path relies
-// on. The split loop is O(n^2), so it is capped; the oracle check always runs.
+// on. The split loop is O(n^2), so it is capped; the whole-buffer check always
+// runs.
 func FuzzUTF8Validate(f *testing.F) {
 	for _, tc := range utf8Cases {
 		f.Add(tc.bytes)
@@ -968,6 +969,9 @@ func FuzzUTF8Validate(f *testing.F) {
 		}
 		for i := 0; i <= len(data); i++ {
 			s := utf8Validate(utf8Accept, data[:i])
+			if got, want := s == utf8Accept, utf8.Valid(data[:i]); got != want {
+				t.Fatalf("prefix accept = %v, utf8.Valid = %v for %x of %x", got, want, data[:i], data)
+			}
 			if s = utf8Validate(s, data[i:]); s != whole {
 				t.Fatalf("split at %d gave state %d, whole = %d for %x", i, s, whole, data)
 			}

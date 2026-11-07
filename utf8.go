@@ -1,5 +1,7 @@
 package websocket
 
+import "unicode/utf8"
+
 // Streaming UTF-8 validation using Björn Höhrmann's DFA.
 
 const (
@@ -40,8 +42,36 @@ var utf8d = [...]uint8{
 }
 
 // utf8Validate advances the DFA state through p.
+//
+// The DFA costs two dependent table loads per byte, so it runs only at the
+// edges of p: to finish a rune split from the previous chunk, and on a rune
+// that may continue into the next one. utf8.Valid checks the complete runes
+// between, eight ASCII bytes at a time.
 func utf8Validate(state uint32, p []byte) uint32 {
-	for _, b := range p {
+	for len(p) > 0 && state != utf8Accept {
+		state = uint32(utf8d[256+state+uint32(utf8d[p[0]])])
+		if state == utf8Reject {
+			return state
+		}
+		p = p[1:]
+	}
+	// A rune that may be incomplete starts at the last byte that is not a
+	// continuation byte, if that byte is among the last three. Any valid
+	// decoding starts a rune there, so the bytes before it must be valid by
+	// themselves.
+	tail := len(p)
+	for i := len(p) - 1; i >= 0 && i >= len(p)-3; i-- {
+		if b := p[i]; b&0xC0 != 0x80 {
+			if b >= 0xC0 {
+				tail = i
+			}
+			break
+		}
+	}
+	if !utf8.Valid(p[:tail]) {
+		return utf8Reject
+	}
+	for _, b := range p[tail:] {
 		state = uint32(utf8d[256+state+uint32(utf8d[b])])
 		if state == utf8Reject {
 			break

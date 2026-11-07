@@ -178,3 +178,35 @@ func TestWriteTextNotValidated(t *testing.T) {
 		})
 	}
 }
+
+// BenchmarkUTF8Validate measures utf8Validate on text of different scripts.
+func BenchmarkUTF8Validate(b *testing.B) {
+	const size = 16 << 10
+	fill := func(s string) []byte {
+		p := bytes.Repeat([]byte(s), size/len(s)+1)
+		n := size
+		for p[n]&0xC0 == 0x80 {
+			n-- // keep whole runes
+		}
+		return p[:n]
+	}
+	for _, bc := range []struct {
+		name string
+		p    []byte
+	}{
+		{"Small", []byte(strings.Repeat("hello, world ", 8))},
+		{"ASCII", fill(`{"id":12345,"name":"hello, world","tags":["a","b"]} `)},
+		{"Latin", fill("Größere Übung für Café und Crème brûlée. ")},
+		{"CJK", fill("日本語のテキストと中文文本。")},
+		{"Emoji", fill("😀🎉🚀👍")},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			b.SetBytes(int64(len(bc.p)))
+			for b.Loop() {
+				if utf8Validate(utf8Accept, bc.p) != utf8Accept {
+					b.Fatal("rejected valid UTF-8")
+				}
+			}
+		})
+	}
+}
