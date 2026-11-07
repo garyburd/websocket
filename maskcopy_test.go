@@ -6,9 +6,7 @@ import (
 	"testing"
 )
 
-// BenchmarkMaskCopy measures maskCopy. To compare the SIMD and portable
-// implementations, run it with and without GOEXPERIMENT=simd and compare the
-// results with benchstat.
+// BenchmarkMaskCopy measures maskCopy.
 func BenchmarkMaskCopy(b *testing.B) {
 	key := [4]byte{0x37, 0xfa, 0x21, 0x3d}
 	for _, n := range []int{16, 32, 64, 128, 256, 1024, 4096, 16384, 65536} {

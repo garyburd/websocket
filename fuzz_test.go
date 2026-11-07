@@ -913,14 +913,13 @@ func refMask(b []byte, key [4]byte, pos int) int {
 // naive per-byte reference (refMask) for arbitrary payloads, keys, and
 // starting positions.
 //
-// The SIMD implementation is built only with GOEXPERIMENT=simd; fuzz both
-// builds. It handles buffers of 64 bytes or more, so the seeds straddle 64
-// and the multiples of the vector widths above it.
+// maskCopy steps by 32, 16, and 8 bytes before its byte loop, so the seeds
+// straddle those sizes and their multiples.
 func FuzzMaskCopy(f *testing.F) {
 	f.Add([]byte("hello, world!"), byte(0x37), byte(0xfa), byte(0x21), byte(0x3d), 0)
 	f.Add(bytes.Repeat([]byte("0123456789"), 13), byte(1), byte(2), byte(3), byte(4), 2)
 	f.Add([]byte(nil), byte(0), byte(0), byte(0), byte(0), 0)
-	for i, n := range []int{63, 64, 65, 72, 79, 80, 95, 96, 127, 128, 129, 200} {
+	for i, n := range []int{7, 8, 15, 16, 23, 24, 31, 32, 33, 47, 56, 63, 64, 65, 72, 79, 80, 95, 96, 127, 128, 129, 200} {
 		b := make([]byte, n)
 		for j := range b {
 			b[j] = byte(j)
