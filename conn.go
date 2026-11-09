@@ -1251,7 +1251,10 @@ func (w *Writer) Write(p []byte) (int, error) {
 	m.n += fill
 	p = p[fill:]
 
-	if m.n < capRoom && !m.final {
+	// p now fits the buffer. A buffer filled exactly is not flushed until
+	// there is more to send: flushing it now would cost an empty final frame
+	// if the message ends here.
+	if len(p) == 0 && !m.final {
 		return total, nil
 	}
 	if m.final || len(p) >= capRoom {
@@ -1330,14 +1333,15 @@ func (w *Writer) ReadFrom(r io.Reader) (int64, error) {
 	capRoom := cap(buf) - maxHeaderLen
 	var total int64
 	for {
-		rd, rerr := r.Read(buf[maxHeaderLen+m.n : cap(buf)])
-		m.n += rd
-		total += int64(rd)
+		// A full buffer is flushed only to make room for the next read.
 		if m.n == capRoom {
 			if err := w.flush(false, nil); err != nil {
 				return total, err
 			}
 		}
+		rd, rerr := r.Read(buf[maxHeaderLen+m.n : cap(buf)])
+		m.n += rd
+		total += int64(rd)
 		if rerr != nil {
 			if rerr == io.EOF {
 				return total, nil

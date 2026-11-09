@@ -571,6 +571,8 @@ func TestPingFromPeerAnsweredWithPong(t *testing.T) {
 // fragmented.
 func TestWriteSingleFrame(t *testing.T) {
 	large := strings.Repeat("z", 300) // >> the 64 B minimum buffer
+	// exact fills the minimum buffer's payload room to the byte.
+	exact := strings.Repeat("e", minWriteBufferSize-maxHeaderLen)
 
 	cases := []struct {
 		name    string
@@ -665,6 +667,46 @@ func TestWriteSingleFrame(t *testing.T) {
 				})
 			},
 			wantOp: opText, want: "last",
+		},
+		{
+			// A write that fills the buffer exactly is held until the message
+			// ends or more arrives; flushing it at once would cost a second,
+			// empty final frame.
+			name:    "ExactBufferFill",
+			bufSize: minWriteBufferSize,
+			write: func(t *testing.T, c *Conn) error {
+				return c.Write(context.Background(), MessageText, nil, func(w *Writer) error {
+					_, err := w.Write([]byte(exact))
+					return err
+				})
+			},
+			wantOp: opText, want: exact,
+		},
+		{
+			name:    "ExactBufferFillAcrossWrites",
+			bufSize: minWriteBufferSize,
+			write: func(t *testing.T, c *Conn) error {
+				return c.Write(context.Background(), MessageText, nil, func(w *Writer) error {
+					if _, err := w.Write([]byte(exact[:20])); err != nil {
+						return err
+					}
+					_, err := w.WriteString(exact[20:])
+					return err
+				})
+			},
+			wantOp: opText, want: exact,
+		},
+		{
+			name:    "ExactBufferFillReadFrom",
+			bufSize: minWriteBufferSize,
+			write: func(t *testing.T, c *Conn) error {
+				return c.Write(context.Background(), MessageText, nil, func(w *Writer) error {
+					// iotest.DataErrReader delivers the last bytes with io.EOF.
+					_, err := w.ReadFrom(iotest.DataErrReader(strings.NewReader(exact)))
+					return err
+				})
+			},
+			wantOp: opText, want: exact,
 		},
 	}
 	for _, tc := range cases {
