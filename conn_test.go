@@ -1165,18 +1165,20 @@ func checkInvalidCloseResult(t *testing.T, err error, code CloseCode, reason str
 func TestShutdownInvalidArgumentSendsClose(t *testing.T) {
 	for _, tc := range invalidCloseCases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, peer := connPair(t)
-			// Fail, not hang, if no close is sent.
-			peer.SetReadDeadline(time.Now().Add(5 * time.Second))
-			got := make(chan peerFrame, 1)
-			go func() { got <- readPeerFrame(t, peer) }()
+			synctest.Test(t, func(t *testing.T) {
+				c, peer := connPair(t)
+				// Fail, not hang, if no close is sent.
+				peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+				got := make(chan peerFrame, 1)
+				go func() { got <- readPeerFrame(t, peer) }()
 
-			err := c.Shutdown(tc.code, tc.reason)
-			checkInvalidCloseResult(t, err, tc.code, tc.reason, tc.wantErrs, <-got, tc.wantCode, tc.wantReason)
-			// The substitute close counts as sent.
-			if err := c.WriteMessage(context.Background(), MessageText, nil, []byte("x")); !errors.Is(err, ErrCloseSent) {
-				t.Errorf("WriteMessage after Shutdown = %v, want ErrCloseSent", err)
-			}
+				err := c.Shutdown(tc.code, tc.reason)
+				checkInvalidCloseResult(t, err, tc.code, tc.reason, tc.wantErrs, <-got, tc.wantCode, tc.wantReason)
+				// The substitute close counts as sent.
+				if err := c.WriteMessage(context.Background(), MessageText, nil, []byte("x")); !errors.Is(err, ErrCloseSent) {
+					t.Errorf("WriteMessage after Shutdown = %v, want ErrCloseSent", err)
+				}
+			})
 		})
 	}
 }
@@ -1184,27 +1186,29 @@ func TestShutdownInvalidArgumentSendsClose(t *testing.T) {
 func TestReaderAbortInvalidArgumentSendsClose(t *testing.T) {
 	for _, tc := range invalidCloseCases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, peer := connPair(t)
-			abortErr := make(chan error, 1)
-			readErr := make(chan error, 1)
-			go func() {
-				readErr <- c.Read(nil, func(r *Reader) error {
-					abortErr <- r.Abort(tc.code, tc.reason)
-					return nil
-				})
-			}()
-			// Start a message but do not send its payload, so only an
-			// aborted Reader lets Read return.
-			if _, err := peer.Write([]byte{0x82, 0x05}); err != nil {
-				t.Fatalf("peer write header: %v", err)
-			}
-			// Fail, not hang, if no close is sent.
-			peer.SetReadDeadline(time.Now().Add(5 * time.Second))
-			f := readPeerFrame(t, peer)
-			checkInvalidCloseResult(t, <-abortErr, tc.code, tc.reason, tc.wantErrs, f, tc.wantCode, tc.wantReason)
-			if err := <-readErr; !errors.Is(err, ErrClosed) {
-				t.Errorf("Read err = %v, want ErrClosed", err)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				c, peer := connPair(t)
+				abortErr := make(chan error, 1)
+				readErr := make(chan error, 1)
+				go func() {
+					readErr <- c.Read(nil, func(r *Reader) error {
+						abortErr <- r.Abort(tc.code, tc.reason)
+						return nil
+					})
+				}()
+				// Start a message but do not send its payload, so only an
+				// aborted Reader lets Read return.
+				if _, err := peer.Write([]byte{0x82, 0x05}); err != nil {
+					t.Fatalf("peer write header: %v", err)
+				}
+				// Fail, not hang, if no close is sent.
+				peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+				f := readPeerFrame(t, peer)
+				checkInvalidCloseResult(t, <-abortErr, tc.code, tc.reason, tc.wantErrs, f, tc.wantCode, tc.wantReason)
+				if err := <-readErr; !errors.Is(err, ErrClosed) {
+					t.Errorf("Read err = %v, want ErrClosed", err)
+				}
+			})
 		})
 	}
 }
@@ -2183,28 +2187,30 @@ func TestFailedPongReplyDisarmsReadWatchdog(t *testing.T) {
 	// failure, which unlike a timeout does propagate) must not leak an
 	// armed read watchdog: after Read returns there is no read in progress,
 	// so a later fire would tear down the connection with nobody reading.
-	c, peer := connPair(t)
+	synctest.Test(t, func(t *testing.T) {
+		c, peer := connPair(t)
 
-	// Deliver a ping, then close the peer side so the pong reply fails
-	// with a transport error.
-	go func() {
-		_ = writePeerFrame(peer, true, opPing, []byte("p"))
-		peer.Close()
-	}()
+		// Deliver a ping, then close the peer side so the pong reply fails
+		// with a transport error.
+		go func() {
+			_ = writePeerFrame(peer, true, opPing, []byte("p"))
+			peer.Close()
+		}()
 
-	_, _, err := c.ReadMessage(&ReadOptions{IdleTimeout: time.Hour})
-	if err == nil || errors.Is(err, ErrTimeout) {
-		t.Fatalf("ReadMessage err = %v, want a transport error", err)
-	}
-	m := c.lockedMonitor()
-	armed := !m.fireAt.IsZero()
-	m.unlock()
-	c.reader.mu <- struct{}{}
-	terminal := c.reader.terminalErr != nil
-	<-c.reader.mu
-	if armed && !terminal {
-		t.Error("read watchdog left armed with no read in progress")
-	}
+		_, _, err := c.ReadMessage(&ReadOptions{IdleTimeout: time.Hour})
+		if err == nil || errors.Is(err, ErrTimeout) {
+			t.Fatalf("ReadMessage err = %v, want a transport error", err)
+		}
+		m := c.lockedMonitor()
+		armed := !m.fireAt.IsZero()
+		m.unlock()
+		c.reader.mu <- struct{}{}
+		terminal := c.reader.terminalErr != nil
+		<-c.reader.mu
+		if armed && !terminal {
+			t.Error("read watchdog left armed with no read in progress")
+		}
+	})
 }
 
 func TestTimersStoppedAfterClose(t *testing.T) {
@@ -2636,23 +2642,25 @@ func TestInvalidUTF8RejectedBeforeFrameCompletes(t *testing.T) {
 		}},
 	} {
 		t.Run(rd.name, func(t *testing.T) {
-			c, peer := connPair(t)
-			errCh := make(chan error, 1)
-			go func() { errCh <- rd.read(c) }()
+			synctest.Test(t, func(t *testing.T) {
+				c, peer := connPair(t)
+				errCh := make(chan error, 1)
+				go func() { errCh <- rd.read(c) }()
 
-			// The rest of the frame is never sent.
-			hdr := []byte{0x81, byte(len(prefix) + len(rest))}
-			if _, err := peer.Write(append(hdr, prefix...)); err != nil {
-				t.Fatalf("peer write: %v", err)
-			}
-			peer.SetReadDeadline(time.Now().Add(5 * time.Second))
-			f := readPeerFrame(t, peer)
-			if f.opcode != opClose || len(f.payload) < 2 || CloseCode(binary.BigEndian.Uint16(f.payload)) != CloseInvalidData {
-				t.Fatalf("peer got %+v, want close %d before the frame completes", f, CloseInvalidData)
-			}
-			if err := <-errCh; !errors.Is(err, ErrProtocol) {
-				t.Errorf("read err = %v, want ErrProtocol", err)
-			}
+				// The rest of the frame is never sent.
+				hdr := []byte{0x81, byte(len(prefix) + len(rest))}
+				if _, err := peer.Write(append(hdr, prefix...)); err != nil {
+					t.Fatalf("peer write: %v", err)
+				}
+				peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+				f := readPeerFrame(t, peer)
+				if f.opcode != opClose || len(f.payload) < 2 || CloseCode(binary.BigEndian.Uint16(f.payload)) != CloseInvalidData {
+					t.Fatalf("peer got %+v, want close %d before the frame completes", f, CloseInvalidData)
+				}
+				if err := <-errCh; !errors.Is(err, ErrProtocol) {
+					t.Errorf("read err = %v, want ErrProtocol", err)
+				}
+			})
 		})
 	}
 }

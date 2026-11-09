@@ -495,32 +495,34 @@ func TestSetWriteDeadlineExtendsBody(t *testing.T) {
 // the integrator owns the deadline, so SetReadDeadline / SetWriteDeadline
 // are rejected with ErrInvalidArgument and the message proceeds untouched.
 func TestSetDeadlineRateConflict(t *testing.T) {
-	c, peer := connPair(t)
-	go drainPeer(peer)
+	synctest.Test(t, func(t *testing.T) {
+		c, peer := connPair(t)
+		go drainPeer(peer)
 
-	err := c.Write(context.Background(), MessageText,
-		&WriteOptions{MinWriteRate: 1 << 20}, func(w *Writer) error {
-			if err := w.SetWriteDeadline(time.Now().Add(time.Hour)); !errors.Is(err, ErrInvalidArgument) {
-				t.Errorf("SetWriteDeadline in rate mode = %v, want ErrInvalidArgument", err)
+		err := c.Write(context.Background(), MessageText,
+			&WriteOptions{MinWriteRate: 1 << 20}, func(w *Writer) error {
+				if err := w.SetWriteDeadline(time.Now().Add(time.Hour)); !errors.Is(err, ErrInvalidArgument) {
+					t.Errorf("SetWriteDeadline in rate mode = %v, want ErrInvalidArgument", err)
+				}
+				_, err := w.Write([]byte("hi"))
+				return err
+			})
+		if err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+
+		go func() { _ = writePeerFrame(peer, true, opText, []byte("hi")) }()
+		err = c.Read(&ReadOptions{MinReadRate: 1 << 20}, func(r *Reader) error {
+			if err := r.SetReadDeadline(time.Now().Add(time.Hour)); !errors.Is(err, ErrInvalidArgument) {
+				t.Errorf("SetReadDeadline in rate mode = %v, want ErrInvalidArgument", err)
 			}
-			_, err := w.Write([]byte("hi"))
+			_, err := io.ReadAll(r)
 			return err
 		})
-	if err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	go func() { _ = writePeerFrame(peer, true, opText, []byte("hi")) }()
-	err = c.Read(&ReadOptions{MinReadRate: 1 << 20}, func(r *Reader) error {
-		if err := r.SetReadDeadline(time.Now().Add(time.Hour)); !errors.Is(err, ErrInvalidArgument) {
-			t.Errorf("SetReadDeadline in rate mode = %v, want ErrInvalidArgument", err)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
 		}
-		_, err := io.ReadAll(r)
-		return err
 	})
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
 }
 
 // TestMinRateExcludesApplicationTime checks that the rate bounds measure the
