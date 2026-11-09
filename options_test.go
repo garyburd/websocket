@@ -202,6 +202,45 @@ func TestSetReadDeadlineBoundsBody(t *testing.T) {
 	})
 }
 
+func TestSetReadDeadlineStopsAtBodyEnd(t *testing.T) {
+	// Like MessageTimeout, a deadline set once the whole body has arrived,
+	// whether or not the application has read it, does not bound the
+	// callback's own work.
+	for _, tc := range []struct {
+		name    string
+		consume bool
+	}{{"consumed", true}, {"buffered unread", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				payload := []byte("complete")
+				var hdr [maxHeaderLen]byte
+				n := buildHeader(hdr[:], true, opText, true, len(payload), [4]byte{})
+				wire := append(hdr[:n:n], payload...)
+				c := newTestConn(t, &sinkRWC{r: bytes.NewReader(wire)})
+
+				err := c.Read(nil, func(r *Reader) error {
+					if tc.consume {
+						if _, err := io.ReadAll(r); err != nil {
+							return err
+						}
+					}
+					if err := r.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+						return err
+					}
+					synctest.Sleep(100 * time.Millisecond)
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("Read: %v", err)
+				}
+				if err := c.loadTerminalErr(); err != nil {
+					t.Fatalf("terminal error after complete body = %v", err)
+				}
+			})
+		})
+	}
+}
+
 func TestMessageTimeoutStopsAtBodyEnd(t *testing.T) {
 	cases := []struct {
 		name    string

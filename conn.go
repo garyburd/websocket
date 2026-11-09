@@ -868,6 +868,8 @@ func (r *Reader) Type() MessageType {
 
 // SetReadDeadline sets the absolute deadline for the current message body. A
 // zero value removes the deadline. It overrides [ReadOptions.MessageTimeout].
+// Like MessageTimeout, it bounds receiving the body, not the callback's work
+// once the whole body has arrived.
 //
 // Expiry is terminal. SetReadDeadline conflicts with [ReadOptions.MinReadRate].
 func (r *Reader) SetReadDeadline(t time.Time) error {
@@ -882,6 +884,11 @@ func (r *Reader) SetReadDeadline(t time.Time) error {
 	defer m.unlock()
 	if m.readRate > 0 {
 		return errSetReadDeadlineRate
+	}
+	// A body that has fully arrived has nothing left to bound: the deadline
+	// covers the transport, not the callback's own work.
+	if m.readState != rsBody {
+		return nil
 	}
 	m.readDeadline = t
 	m.arm(m.readDeadline)
