@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/garyburd/websocket"
 )
@@ -35,6 +36,10 @@ const (
 
 	// Maximum message size allowed from the peer.
 	maxMessageSize = 8192
+
+	// Longest piece of command output sent in one message. A longer line is
+	// sent in pieces.
+	maxLineSize = 8192
 )
 
 // Outbound messages are prefixed with a stream tag so the browser can style
@@ -199,16 +204,37 @@ func inputPump(conn *websocket.Conn, stdin io.WriteCloser) {
 // commands produce. Output with non-UTF-8 bytes would form an invalid text
 // message and the browser would close the connection with status 1007; handling
 // arbitrary bytes would need binary messages or scrubbing instead.
+//
+// The pump must read r to the end: a command whose pipe is no longer drained
+// blocks on its next write and never exits. So a line longer than maxLineSize
+// is sent in pieces (see scanLines) rather than ending the scan.
 func streamPump(conn *websocket.Conn, r io.Reader, tag byte) {
 	opts := &websocket.WriteOptions{MessageTimeout: writeWait}
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 4096), maxMessageSize)
+	sc.Buffer(make([]byte, 0, 4096), maxLineSize)
+	sc.Split(scanLines)
 	for sc.Scan() {
 		msg := append([]byte{tag}, sc.Bytes()...)
 		if err := conn.WriteMessage(context.Background(), websocket.MessageText, opts, msg); err != nil {
-			return // connection gone; inputPump owns Close
+			return // connection gone; serveWs kills the command
 		}
 	}
+}
+
+// scanLines is a [bufio.SplitFunc] like [bufio.ScanLines], except that a line
+// reaching maxLineSize is split instead of failing the scan with
+// [bufio.ErrTooLong]. A piece ends before the last rune that starts in it, so
+// each piece of valid UTF-8 output is itself valid UTF-8.
+func scanLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	advance, token, err = bufio.ScanLines(data, atEOF)
+	if advance > 0 || err != nil || len(data) < maxLineSize {
+		return advance, token, err
+	}
+	n := len(data) - 1
+	for n > len(data)-utf8.UTFMax && !utf8.RuneStart(data[n]) {
+		n--
+	}
+	return n, data[:n], nil
 }
 
 func main() {
