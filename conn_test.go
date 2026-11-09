@@ -2998,3 +2998,25 @@ func TestCloseReplyBlockedOnFrameLockBoundedByReadLiveness(t *testing.T) {
 		}
 	}
 }
+
+func TestFailedPongReplyIsStickyReadError(t *testing.T) {
+	// A pong reply that fails on the transport ends the connection. The read
+	// that sent it records the failure, so every later read reports the same
+	// error rather than whatever the closed transport happens to return.
+	c, peer := connPair(t)
+	go func() {
+		_ = writePeerFrame(peer, true, opPing, []byte("p"))
+		peer.Close()
+	}()
+
+	_, _, err := c.ReadMessage(nil)
+	if err == nil {
+		t.Fatal("ReadMessage err = nil, want a transport error")
+	}
+	if got := c.errRead(); got != err {
+		t.Errorf("sticky read error = %v, want %v", got, err)
+	}
+	if _, _, err2 := c.ReadMessage(nil); err2 != err {
+		t.Errorf("second ReadMessage err = %v, want %v", err2, err)
+	}
+}

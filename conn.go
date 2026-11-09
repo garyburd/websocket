@@ -1401,9 +1401,10 @@ func (c *Conn) handleControlFrame(h frameHeader) error {
 	}
 	switch h.opcode {
 	case opPing:
-		// A missed bounded pong leaves the read usable.
+		// A missed bounded pong leaves the read usable. Any other failure
+		// ended the write side, and the read ends with it.
 		if err := c.writeControlFrame(opPong, payload, c.frame.controlDeadline()); err != nil && !errors.Is(err, ErrTimeout) {
-			return err
+			return c.terminateRead(err)
 		}
 		if !c.reader.matchPong {
 			c.monitor.noteControl()
