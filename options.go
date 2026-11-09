@@ -136,8 +136,9 @@ type ReadOptions struct {
 	MessageTimeout time.Duration
 
 	// MinReadRate is the minimum body rate in bytes per second. A read receives
-	// size/rate time, so large buffers delay stall detection. Zero disables the
-	// rate check. It conflicts with MessageTimeout and [Reader.SetReadDeadline].
+	// size/rate time, so large buffers delay stall detection. Time the
+	// application spends between reads is not counted. Zero disables the rate
+	// check. It conflicts with MessageTimeout and [Reader.SetReadDeadline].
 	MinReadRate int
 
 	// SkipUTF8Validation disables validation of inbound text messages. Invalid
@@ -156,8 +157,9 @@ type WriteOptions struct {
 	MessageTimeout time.Duration
 
 	// MinWriteRate is the minimum body rate in bytes per second. A frame receives
-	// size/rate time, so large frames delay stall detection. Zero disables the
-	// rate check. It conflicts with MessageTimeout and [Writer.SetWriteDeadline].
+	// size/rate time, so large frames delay stall detection. Time the
+	// application spends between writes is not counted. Zero disables the rate
+	// check. It conflicts with MessageTimeout and [Writer.SetWriteDeadline].
 	MinWriteRate int
 }
 

@@ -483,3 +483,63 @@ func TestSetDeadlineRateConflict(t *testing.T) {
 		t.Fatalf("Read: %v", err)
 	}
 }
+
+// TestMinRateExcludesApplicationTime checks that the rate bounds measure the
+// peer, not the application: time a callback spends between reads or writes
+// does not count, however long, while the peer keeps up.
+func TestMinRateExcludesApplicationTime(t *testing.T) {
+	t.Run("Read", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, peer := connPair(t)
+			const total = 8000
+			go func() {
+				// Two fragments, so the pause also precedes a header read.
+				_ = writePeerFrame(peer, false, opBinary, make([]byte, total/2))
+				_ = writePeerFrame(peer, true, opContinuation, make([]byte, total/2))
+			}()
+			var n int
+			err := c.Read(&ReadOptions{MinReadRate: 1000}, func(r *Reader) error {
+				buf := make([]byte, 500)
+				for {
+					k, err := r.Read(buf)
+					n += k
+					if err == io.EOF {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					synctest.Sleep(3 * time.Second) // slow consumer
+				}
+			})
+			if err != nil || n != total {
+				t.Fatalf("Read = %d bytes, %v; want %d, nil", n, err, total)
+			}
+			if err := c.loadTerminalErr(); err != nil {
+				t.Fatalf("terminal error after slow consumer = %v", err)
+			}
+		})
+	})
+	t.Run("Write", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, peer := connPair(t)
+			go func() { _, _ = io.Copy(io.Discard, peer) }()
+			err := c.Write(context.Background(), MessageBinary, &WriteOptions{MinWriteRate: 1000}, func(w *Writer) error {
+				chunk := make([]byte, 5000) // larger than the buffer: each write flushes
+				for range 3 {
+					if _, err := w.Write(chunk); err != nil {
+						return err
+					}
+					synctest.Sleep(3 * time.Second) // slow producer
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if err := c.loadTerminalErr(); err != nil {
+				t.Fatalf("terminal error after slow producer = %v", err)
+			}
+		})
+	})
+}

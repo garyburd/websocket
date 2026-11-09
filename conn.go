@@ -126,6 +126,9 @@ const (
 	rsIdle = iota
 	rsAwaitingData
 	rsBody
+	// rsDone is a body whose last byte has arrived from the transport, so no
+	// body bound applies, though the application may still be reading it.
+	rsDone
 )
 
 // readMonitor owns the read liveness state and watchdog.
@@ -150,6 +153,11 @@ type readMonitor struct {
 	msgTimeout        time.Duration
 	readRate          int
 	readDeadline      time.Time
+
+	// appSince is when a rate-bound body last returned control to the
+	// application; it is zero while the transport is being read. The time
+	// since is the application's and is not charged to the peer.
+	appSince time.Time
 }
 
 func (c *Conn) lockedMonitor() *readMonitor {
@@ -294,44 +302,58 @@ func (m *readMonitor) beginBody() {
 	switch {
 	case m.msgTimeout > 0:
 		m.readDeadline = now.Add(m.msgTimeout)
+		m.arm(m.readDeadline)
 	case m.readRate > 0:
+		// The rate watchdog runs only while the transport is being read.
 		m.readDeadline = now.Add(rateGrace)
+		m.appSince = now
+		m.disarm()
 	default:
 		m.readDeadline = time.Time{}
+		m.disarm()
 	}
-	m.arm(m.readDeadline)
 }
 
 // noteControl refreshes keepalive without extending the idle deadline.
 func (m *readMonitor) noteControl() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.readState == rsBody {
+	if m.readState == rsBody || m.readState == rsDone {
 		return
 	}
 	m.readState = rsIdle
 	m.armReadWait(time.Now())
 }
 
-// beginFill grants n bytes of rate allowance without crediting them.
+// beginFill starts a transport read under the rate watchdog, granting n bytes
+// of allowance without crediting them. The deadline first moves out by the
+// time the application held control. A fill with n == 0 waits for a frame
+// header.
 func (m *readMonitor) beginFill(n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.readRate <= 0 || m.readState != rsBody {
 		return
 	}
+	if !m.appSince.IsZero() {
+		m.readDeadline = m.readDeadline.Add(time.Since(m.appSince))
+		m.appSince = time.Time{}
+	}
 	m.arm(m.readDeadline.Add(rateAllowance(m.readRate, n)))
 }
 
-// endFill credits a completed fill and re-arms the rate deadline.
+// endFill credits a completed fill and stops the rate watchdog until the
+// application reads again.
 func (m *readMonitor) endFill(n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.readRate <= 0 || m.readState != rsBody {
 		return
 	}
-	m.readDeadline = rollRateDeadline(m.readDeadline, m.readRate, n, time.Now())
-	m.arm(m.readDeadline)
+	now := time.Now()
+	m.readDeadline = rollRateDeadline(m.readDeadline, m.readRate, n, now)
+	m.appSince = now
+	m.disarm()
 }
 
 // endBody disarms body progress checks once the final payload is consumed.
@@ -342,6 +364,7 @@ func (m *readMonitor) endBody() {
 	if m.readState != rsBody {
 		return
 	}
+	m.readState = rsDone
 	m.readDeadline = time.Time{}
 	m.disarm()
 }
@@ -618,6 +641,11 @@ type writer struct {
 	deadline       time.Time
 	rate           int
 	messageTimeout time.Duration
+
+	// appSince is when a rate-bound message last returned control to the
+	// application. The time since is the application's and is not charged
+	// to the peer.
+	appSince time.Time
 
 	// writers is a ring of message handles, and next indexes the slot for
 	// the next message. A pointer into the connection avoids allocating a
@@ -935,6 +963,9 @@ func (r *Reader) Read(p []byte) (int, error) {
 			m.err = io.EOF
 			return 0, io.EOF
 		}
+		if m.rateMode {
+			c.monitor.beginFill(0)
+		}
 		if err := c.readFragment(false); err != nil {
 			m.err = err
 			return 0, m.err
@@ -1142,6 +1173,7 @@ func (c *Conn) nextWriter(ctx context.Context, mt MessageType, opts *WriteOption
 		c.writer.deadline = now.Add(c.writer.messageTimeout)
 	case c.writer.rate > 0:
 		c.writer.deadline = now.Add(rateGrace)
+		c.writer.appSince = now
 	default:
 		c.writer.deadline = time.Time{}
 	}
@@ -1260,9 +1292,14 @@ func (w *Writer) flush(fin bool, overflow []byte) error {
 	}
 	buf := (*m.bufp)[:maxHeaderLen+m.n]
 	if m.rate > 0 {
-		m.deadline = rateDeadline(m.deadline, m.rate, m.n+len(overflow), time.Now())
+		now := time.Now()
+		m.deadline = rateDeadline(m.deadline.Add(now.Sub(m.appSince)), m.rate, m.n+len(overflow), now)
 	}
-	if err := c.writeFrame(op, fin, buf, overflow, m.deadline); err != nil {
+	err := c.writeFrame(op, fin, buf, overflow, m.deadline)
+	if m.rate > 0 {
+		m.appSince = time.Now()
+	}
+	if err != nil {
 		m.err = err
 		return err
 	}
