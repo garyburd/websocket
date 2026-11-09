@@ -193,16 +193,20 @@ func (c *Conn) terminateConn(err error) error {
 
 // terminateRead records the sticky read error. reader.mu is held.
 func (c *Conn) terminateRead(err error) error {
+	return c.terminateReadReply(err, nil, false)
+}
+
+// terminateReadReply records the sticky read error and sends a close frame: the
+// response to a protocol error, or reply if send is set. reader.mu is held.
+func (c *Conn) terminateReadReply(err error, reply []byte, send bool) error {
 	if c.reader.terminalErr != nil {
 		return c.reader.terminalErr
 	}
-	m := c.lockedMonitor()
-	m.disarm()
-	m.unlock()
 	var pe *protocolError
 	var ce *CloseError
 	switch {
 	case errors.As(err, &pe):
+		reply, send = buildClosePayload(pe.code, pe.text), true
 	case errors.As(err, &ce):
 	default:
 		if e := c.loadTerminalErr(); e != nil {
@@ -213,10 +217,16 @@ func (c *Conn) terminateRead(err error) error {
 		err = ErrClosed
 	}
 	c.reader.terminalErr = err
-	if pe != nil {
-		// A failed protocol-close response does not replace the peer error.
-		_ = c.writeControlFrame(opClose, buildClosePayload(pe.code, pe.text), c.frame.controlDeadline())
+	if send {
+		// The watchdog stays armed across the write. A writer stalled on a
+		// peer that stopped reading holds frame.mu, and with no
+		// ControlReplyTimeout only the read's liveness bounds can break the
+		// wait. A failed close does not replace the error already recorded.
+		_ = c.writeControlFrame(opClose, reply, c.frame.controlDeadline())
 	}
+	m := c.lockedMonitor()
+	m.disarm()
+	m.unlock()
 	return err
 }
 
@@ -868,9 +878,11 @@ func (r *Reader) Abort(code CloseCode, reason string) error {
 	}
 	c.reader.err = errReaderAborted
 	c.reader.terminalErr = errReaderAborted
-	c.monitor.endRead()
 	// The close is best-effort; report a substitution only if it was sent.
-	if c.writeControlFrame(opClose, payload, c.frame.controlDeadline()) != nil {
+	// The watchdog stays armed across the write, as in terminateReadReply.
+	err := c.writeControlFrame(opClose, payload, c.frame.controlDeadline())
+	c.monitor.endRead()
+	if err != nil {
 		return nil
 	}
 	return argErr
@@ -1360,12 +1372,9 @@ func (c *Conn) handleControlFrame(h frameHeader) error {
 			return c.terminateRead(err)
 		}
 		closeErr := &CloseError{Code: code, Text: reason}
-		c.terminateRead(closeErr)
 		// In manual mode the unsent response leaves closeSent clear, so the
 		// application's remaining writes are not rejected with ErrCloseSent.
-		if !c.manualCloseResponse {
-			_ = c.writeControlFrame(opClose, payload, c.frame.controlDeadline())
-		}
+		c.terminateReadReply(closeErr, payload, !c.manualCloseResponse)
 		return closeErr
 	default:
 		return c.terminateRead(peerError(CloseProtocolError, "unknown control opcode %d", h.opcode))

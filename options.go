@@ -24,9 +24,9 @@ type DialOptions struct {
 	// Each value must be a nonempty HTTP token. See [Conn.Subprotocol].
 	Subprotocols []string
 
-	// ControlReplyTimeout bounds automatic pong and close writes. Zero waits
-	// indefinitely. It does not apply to keepalive pings, [Conn.Shutdown], or
-	// data messages.
+	// ControlReplyTimeout bounds automatic pong and close writes. Zero sets no
+	// bound of its own; the bounds in the read's [ReadOptions] still apply. It
+	// does not apply to keepalive pings, [Conn.Shutdown], or data messages.
 	ControlReplyTimeout time.Duration
 
 	// ShutdownTimeout bounds both sending a close and waiting for its response.
@@ -76,9 +76,9 @@ type UpgradeOptions struct {
 	// not hijack or write a success status. If nil, Upgrade uses [http.Error].
 	OnError func(w http.ResponseWriter, r *http.Request, status int, err error)
 
-	// ControlReplyTimeout bounds automatic pong and close writes. Zero waits
-	// indefinitely. It does not apply to keepalive pings, [Conn.Shutdown], or
-	// data messages.
+	// ControlReplyTimeout bounds automatic pong and close writes. Zero sets no
+	// bound of its own; the bounds in the read's [ReadOptions] still apply. It
+	// does not apply to keepalive pings, [Conn.Shutdown], or data messages.
 	ControlReplyTimeout time.Duration
 
 	// ShutdownTimeout bounds both sending a close and waiting for its response.

@@ -2905,3 +2905,54 @@ func TestConnWriteDoesNotAllocate(t *testing.T) {
 		}
 	}
 }
+
+func TestCloseReplyBlockedOnFrameLockBoundedByReadLiveness(t *testing.T) {
+	// A peer that stops reading and then sends a close (or a frame that draws
+	// a protocol-error close) parks the reply behind the stalled writer's
+	// frame lock. With no ControlReplyTimeout, the read's liveness bounds
+	// must still end the wait: the read reports the peer's error and the
+	// stalled writer is released.
+	cases := []struct {
+		name  string
+		frame []byte
+		check func(error) bool
+	}{
+		{"peer close", []byte{0x88, 0x00}, func(err error) bool {
+			var ce *CloseError
+			return errors.As(err, &ce) && ce.Code == CloseNoStatusReceived
+		}},
+		{"protocol error", []byte{0x83, 0x00}, func(err error) bool { return errors.Is(err, ErrProtocol) }},
+	}
+	opts := []struct {
+		name string
+		opts *ReadOptions
+	}{
+		{"IdleTimeout", &ReadOptions{IdleTimeout: 50 * time.Millisecond}},
+		{"Keepalive", &ReadOptions{KeepaliveInterval: 50 * time.Millisecond, KeepaliveTimeout: 50 * time.Millisecond}},
+	}
+	for _, tc := range cases {
+		for _, o := range opts {
+			t.Run(tc.name+"/"+o.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					c, peer := connPair(t, withWriteTimeout(0))
+
+					userWrite := make(chan error, 1)
+					go func() {
+						// The peer never reads, so this holds the frame lock.
+						userWrite <- c.WriteMessage(context.Background(), MessageText, nil, []byte("stuck"))
+					}()
+					synctest.Wait()
+
+					go func() { _, _ = peer.Write(tc.frame) }()
+
+					if _, _, err := c.ReadMessage(o.opts); !tc.check(err) {
+						t.Errorf("ReadMessage err = %v, want the peer's error", err)
+					}
+					if err := <-userWrite; !errors.Is(err, ErrTimeout) {
+						t.Errorf("stalled WriteMessage err = %v, want ErrTimeout", err)
+					}
+				})
+			})
+		}
+	}
+}
