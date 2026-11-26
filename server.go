@@ -14,6 +14,11 @@ import (
 // Upgrade accepts a WebSocket handshake and takes ownership of the underlying
 // HTTP/1.x connection.
 //
+// By default, Upgrade rejects cross-origin requests and selects no
+// subprotocol. Configure these with [UpgradeOptions.CheckOrigin] (see
+// [AllowedOrigins]) and [UpgradeOptions.SelectSubprotocol] (see
+// [SupportedSubprotocols]).
+//
 // If the client's handshake has a protocol error, Upgrade writes an HTTP error
 // response and returns an error that wraps [ErrBadHandshake]. On success, the
 // returned [Conn] owns the connection. Either way, the handler must not use w

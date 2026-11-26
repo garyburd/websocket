@@ -88,8 +88,7 @@ type UpgradeOptions struct {
 	// MaxMessageSize limits one inbound message. Exceeding it sends
 	// [CloseMessageTooBig] and returns [ErrProtocol]. Zero is unlimited.
 	//
-	// Servers should set a limit: with zero, an untrusted client can make
-	// [Conn.ReadMessage] allocate without bound.
+	// Servers should set a limit; see [Conn.ReadMessage].
 	MaxMessageSize int
 
 	// WriteBufferSize is the per-frame coalescing buffer size. Zero uses 4 KiB;
@@ -149,8 +148,7 @@ type ReadOptions struct {
 // WriteOptions configures one [Conn.Write] or [Conn.WriteMessage]. Nil disables
 // write-side liveness checks.
 //
-// A write copies the options when it begins. Its context bounds only writer
-// acquisition; these options bound the message body.
+// A write copies the options when it begins.
 type WriteOptions struct {
 	// MessageTimeout bounds a message from callback entry. Zero is unbounded.
 	// It conflicts with MinWriteRate; [Writer.SetWriteDeadline] overrides it.

@@ -1,22 +1,80 @@
 // Package websocket implements RFC 6455 clients and servers with a
 // message-oriented API.
 //
-// # Connections
+// # Getting started
 //
-// Clients use [Dial]. HTTP handlers use [Upgrade], which requires HTTP/1.x and
-// rejects cross-origin requests by default. Use [AllowedOrigins] to configure
-// origin policy and [SupportedSubprotocols] to select a subprotocol.
+// A server upgrades an HTTP request with [Upgrade], and a client connects with
+// [Dial]. Both return a [Conn]. An application then uses the connection in
+// three parts:
 //
-// # Messages
+//   - One goroutine reads messages for the connection's lifetime, even if the
+//     application ignores them. See Connection management below.
+//   - Any number of goroutines write messages.
+//   - When the connection ends, call [Conn.Close]. To close gracefully, call
+//     [Conn.Shutdown] first and keep reading until the read fails.
 //
-// [Conn.ReadMessage] and [Conn.WriteMessage] use complete byte slices.
-// [Conn.Read] and [Conn.Write] stream messages through scoped callbacks.
+// This handler echoes each message back to the client:
+//
+//	func echo(w http.ResponseWriter, r *http.Request) {
+//		c, err := websocket.Upgrade(w, r, nil)
+//		if err != nil {
+//			return // Upgrade has written an HTTP error response
+//		}
+//		defer c.Close()
+//		for {
+//			data, mt, err := c.ReadMessage(nil)
+//			if err != nil {
+//				return
+//			}
+//			if err := c.WriteMessage(context.Background(), mt, nil, data); err != nil {
+//				return
+//			}
+//		}
+//	}
+//
+// This client function connects to the echo handler, served at
+// wss://example.com/echo, sends one message, and prints the echoed reply:
+//
+//	func hello(ctx context.Context) error {
+//		c, _, err := websocket.Dial(ctx, "wss://example.com/echo", nil, nil)
+//		if err != nil {
+//			return err
+//		}
+//		defer c.Close()
+//		if err := c.WriteMessage(ctx, websocket.MessageText, nil, []byte("hello")); err != nil {
+//			return err
+//		}
+//		data, _, err := c.ReadMessage(nil)
+//		if err != nil {
+//			return err
+//		}
+//		fmt.Printf("%s\n", data)
+//		return nil
+//	}
+//
+// The examples use [Conn.ReadMessage] and [Conn.WriteMessage], which hold a
+// whole message in memory. [Conn.Read] and [Conn.Write] stream a message
+// through a callback instead.
+//
+// Nil options are valid everywhere and mean no limits: no timeouts, no
+// keepalive, and no maximum message size. A server that accepts untrusted
+// clients should set [UpgradeOptions.MaxMessageSize] and read with
+// [ReadOptions] that set keepalive or an idle timeout.
 //
 // # Concurrency
 //
-// One goroutine may read while any number write. Concurrent reads return
-// [ErrInvalidArgument]. A write context bounds only writer acquisition;
-// [ReadOptions] and [WriteOptions] bound message I/O.
+// A [Conn] supports one reader and any number of writers at the same time:
+//
+//   - One goroutine at a time may call [Conn.Read] or [Conn.ReadMessage]. A
+//     concurrent read returns [ErrInvalidArgument].
+//   - Any number of goroutines may call [Conn.Write] or [Conn.WriteMessage].
+//     Messages are not interleaved: a write waits until the previous message
+//     is sent, and its context bounds only that wait. [WriteOptions] bound
+//     sending the message itself.
+//   - Any goroutine may call [Conn.Shutdown] or [Conn.Close] at any time. Close
+//     unblocks reads and writes in progress.
+//
+// A [Reader] or [Writer] is valid only during the callback that received it.
 //
 // # Connection management
 //
@@ -53,33 +111,13 @@
 //	}()
 //
 // An application that implements its own read loop must stop on the first
-// error: terminal errors are sticky, so a loop that retries spins. To discard
-// a message, return nil from the [Conn.Read] callback; [Conn.ReadMessage]
-// buffers the message first. [DialOptions.MaxMessageSize] and
-// [UpgradeOptions.MaxMessageSize] still apply, so an oversized message ends
-// the loop even when it would be discarded.
+// terminal error, as described at [Conn.Read]; a loop that retries spins.
 //
-// [Conn.Shutdown] sends a close frame and returns without waiting. Continue
-// reading until a read returns an error, then call [Conn.Close]. Without an
-// active read, the peer's close response is not processed and graceful shutdown
-// cannot complete.
+// # Errors
 //
-// # Closing and errors
-//
-// [Conn.Close] immediately tears down the transport, unblocking in-flight
-// reads and writes.
-//
-// Terminal read errors are sticky. Use errors.As for [CloseError] and errors.Is
-// for [ErrClosed], [ErrTimeout], [ErrProtocol], and [ErrInvalidArgument]. Stop
-// the read loop on any terminal error.
-//
-// A write returns [ErrCloseSent] while a closing handshake is in progress:
-// stop writing data, but keep reading so the handshake completes.
-//
-// # Text messages
-//
-// Inbound text is validated as UTF-8 unless
-// [ReadOptions.SkipUTF8Validation] is set. Outbound text is not validated;
-// check untrusted text (e.g. utf8.Valid) before sending, or the peer may
-// close the connection with 1007.
+// Use errors.As for [CloseError], which reports the peer's close, and
+// errors.Is for [ErrClosed] (a local close), [ErrTimeout], [ErrProtocol],
+// [ErrCloseSent], and [ErrInvalidArgument]. Handshake failures match
+// [ErrBadHandshake] or [ErrBadStatus]. Each method's documentation says which
+// errors leave the connection usable.
 package websocket

@@ -68,7 +68,8 @@ var (
 	ErrBadStatus = fmt.Errorf("%w: unexpected status", ErrBadHandshake)
 
 	// ErrCloseSent reports a data write attempted after this endpoint sent a
-	// close frame.
+	// close frame. Stop writing data, but keep reading so the closing
+	// handshake completes.
 	ErrCloseSent = errors.New("websocket: cannot write after close")
 
 	// ErrInvalidArgument reports a rejected argument or option. The connection
