@@ -186,27 +186,20 @@ func ExampleCloseError() {
 	}
 }
 
-// An application that only sends data must still keep a read outstanding, so the
-// package can answer the peer's pings and observe its close. Run a discarding read
-// loop in its own goroutine alongside the writer; the keepalive options on the read
-// detect a peer that has gone away.
-func ExampleConn_Read_writeOnly() {
+// An application that only sends data runs DiscardMessages alongside its writer.
+// The keepalive options detect a peer that has gone away.
+func ExampleDiscardMessages() {
 	var c *websocket.Conn // obtained from websocket.Dial or websocket.Upgrade
 
-	// Discard inbound data, but let the package handle control frames and surface
-	// the peer's close. The first error ends the loop and closes the connection.
+	// The first read error closes the connection, which ends the writer below.
 	go func() {
 		opts := &websocket.ReadOptions{
 			KeepaliveInterval: 30 * time.Second,
 			KeepaliveTimeout:  10 * time.Second,
 			MatchPong:         true,
 		}
-		for {
-			if err := c.Read(opts, func(*websocket.Reader) error { return nil }); err != nil {
-				c.Close()
-				return
-			}
-		}
+		err := websocket.DiscardMessages(c, opts)
+		log.Printf("connection ended: %v", err)
 	}()
 
 	// Send the time once a second until the connection goes away.

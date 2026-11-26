@@ -22,23 +22,42 @@
 //
 // The package does not read in the background. Keep a [Conn.Read] or
 // [Conn.ReadMessage] call active for the connection's lifetime, even when the
-// application discards data messages. Reads answer pings, process pongs and
-// close frames, and drive keepalive.
+// application only writes. Reads answer pings, process pongs and close frames,
+// and drive keepalive. Without an active read:
 //
-// This loop discards data messages while preserving connection management.
-// Returning nil from the callback drains the current message:
+//   - the peer's pings go unanswered, and the peer may drop the connection;
+//   - keepalive does not run, so a dead peer goes undetected;
+//   - the peer's close is not observed;
+//   - [Conn.Shutdown] cannot complete, and only its timeout ends the
+//     connection.
 //
-//	func readUntilClosed(c *websocket.Conn, opts *websocket.ReadOptions) error {
-//		defer c.Close()
-//		for {
-//			err := c.Read(opts, func(*websocket.Reader) error {
-//				return nil
-//			})
-//			if err != nil {
-//				return err
-//			}
-//		}
-//	}
+// An application that ignores inbound messages runs [DiscardMessages], which
+// closes the connection when the read fails. Pass [ReadOptions] with keepalive
+// to detect a dead peer:
+//
+//	go func() {
+//		err := websocket.DiscardMessages(c, opts)
+//		log.Printf("connection ended: %v", err)
+//	}()
+//
+// To treat an inbound data message as a protocol violation instead, call
+// [Conn.Read] once. It handles control frames while waiting, and the callback
+// fails the connection when the first data message arrives:
+//
+//	go func() {
+//		err := c.Read(opts, func(r *websocket.Reader) error {
+//			return r.Abort(websocket.ClosePolicyViolation, "unexpected data message")
+//		})
+//		log.Printf("connection ended: %v", err)
+//		c.Close()
+//	}()
+//
+// An application that implements its own read loop must stop on the first
+// error: terminal errors are sticky, so a loop that retries spins. To discard
+// a message, return nil from the [Conn.Read] callback; [Conn.ReadMessage]
+// buffers the message first. [DialOptions.MaxMessageSize] and
+// [UpgradeOptions.MaxMessageSize] still apply, so an oversized message ends
+// the loop even when it would be discarded.
 //
 // [Conn.Shutdown] sends a close frame and returns without waiting. Continue
 // reading until a read returns an error, then call [Conn.Close]. Without an

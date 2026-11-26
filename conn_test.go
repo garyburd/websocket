@@ -1426,6 +1426,80 @@ func TestCloseIdempotentAndSticky(t *testing.T) {
 	}
 }
 
+// TestDiscardMessages covers the documented contract: data messages are
+// discarded, control frames are still handled, and the first read error is
+// returned after the connection is closed.
+func TestDiscardMessages(t *testing.T) {
+	t.Run("PeerClose", func(t *testing.T) {
+		c, peer := connPair(t)
+		go func() {
+			_ = writePeerFrame(peer, true, opText, []byte("one"))
+			_ = writePeerFrame(peer, false, opBinary, []byte("two"))
+			_ = writePeerFrame(peer, true, opContinuation, []byte("three"))
+			_ = writePeerFrame(peer, true, opPing, []byte("p"))
+			if f := readPeerFrame(t, peer); f.opcode != opPong || string(f.payload) != "p" {
+				t.Errorf("expected pong %q, got %+v", "p", f)
+			}
+			_ = writePeerFrame(peer, true, opClose, []byte{0x03, 0xe8}) // code 1000
+			if f := readPeerFrame(t, peer); f.opcode != opClose {
+				t.Errorf("expected close reply, got %+v", f)
+			}
+		}()
+		err := DiscardMessages(c, nil)
+		var ce *CloseError
+		if !errors.As(err, &ce) || ce.Code != CloseNormalClosure {
+			t.Fatalf("DiscardMessages = %v, want *CloseError with code %d", err, CloseNormalClosure)
+		}
+		// The transport is closed, so the peer reads EOF.
+		_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Errorf("peer read after DiscardMessages = %v, want io.EOF", err)
+		}
+	})
+
+	t.Run("InvalidOptions", func(t *testing.T) {
+		c, peer := connPair(t)
+		go drainPeer(peer)
+		err := DiscardMessages(c, &ReadOptions{IdleTimeout: -1})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("DiscardMessages = %v, want ErrInvalidArgument", err)
+		}
+		// Unlike Read, DiscardMessages closes the connection on every return.
+		if _, _, err := c.ReadMessage(nil); !errors.Is(err, ErrClosed) {
+			t.Errorf("ReadMessage after DiscardMessages = %v, want ErrClosed", err)
+		}
+	})
+}
+
+// TestRejectDataMessagePattern covers the reject pattern in the package
+// documentation: one Read answers control frames while waiting, and the first
+// data message fails the connection with ClosePolicyViolation.
+func TestRejectDataMessagePattern(t *testing.T) {
+	c, peer := connPair(t)
+	go func() {
+		_ = writePeerFrame(peer, true, opPing, []byte("p"))
+		if f := readPeerFrame(t, peer); f.opcode != opPong || string(f.payload) != "p" {
+			t.Errorf("expected pong %q, got %+v", "p", f)
+		}
+		// Send only the header of a 5-byte text message: Abort does not
+		// drain, and net.Pipe would block a payload write that is never
+		// read.
+		_, _ = peer.Write([]byte{0x81, 0x05})
+		f := readPeerFrame(t, peer)
+		if f.opcode != opClose || len(f.payload) < 2 ||
+			CloseCode(binary.BigEndian.Uint16(f.payload)) != ClosePolicyViolation {
+			t.Errorf("expected close %d, got %+v", ClosePolicyViolation, f)
+		}
+	}()
+	err := c.Read(nil, func(r *Reader) error {
+		return r.Abort(ClosePolicyViolation, "unexpected data message")
+	})
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("Read = %v, want ErrClosed", err)
+	}
+	c.Close()
+}
+
 func TestReaderDrainsOnClose(t *testing.T) {
 	c, peer := connPair(t)
 

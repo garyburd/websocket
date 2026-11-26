@@ -553,6 +553,9 @@ func rateDeadline(deadline time.Time, rate, n int, now time.Time) time.Time {
 
 // Conn is a WebSocket connection created by [Dial] or [Upgrade]. One goroutine
 // may read while any number of goroutines write concurrently.
+//
+// Keep a read active for the connection's lifetime, even when the application
+// only writes; see the package documentation's Connection management section.
 type Conn struct {
 	rwc io.ReadWriteCloser
 	br  *bufio.Reader
@@ -1082,6 +1085,26 @@ func (c *Conn) ReadMessage(opts *ReadOptions) ([]byte, MessageType, error) {
 	defer r.close()
 	data, err := io.ReadAll(r)
 	return data, r.Type(), err
+}
+
+// DiscardMessages reads data messages and discards them until a read fails,
+// then closes c and returns the read error.
+//
+// It covers the common case of an application that ignores inbound messages.
+// See the package documentation's Connection management section for why a
+// connection needs an active read and for other options, such as failing the
+// connection when a message arrives.
+//
+// Do not use it with [DialOptions.ManualCloseResponse] or
+// [UpgradeOptions.ManualCloseResponse]: closing c on the peer's close leaves
+// the application no chance to respond.
+func DiscardMessages(c *Conn, opts *ReadOptions) error {
+	defer c.Close()
+	for {
+		if err := c.Read(opts, func(*Reader) error { return nil }); err != nil {
+			return err
+		}
+	}
 }
 
 // Write passes a streaming message writer to fn and finishes the message when
